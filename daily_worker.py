@@ -68,9 +68,31 @@ def extract_video_id(url):
     match = re.search(r'(?:v=|/|embed/|youtu\.be/)([\w-]{11})(?=&|\?|$)', url)
     return match.group(1) if match else None
 
-# --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
+# --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE (FIX DUPLICATE LOGIC) ---
 def sync_progress_to_db():
-    print("\n>>> TASK 1: Syncing Metadata (Progress -> DB) - CLEAN VERSION...")
+    print("\n>>> TASK 1: Syncing Metadata (Progress -> DB) - SMART MATCHING...")
+    
+    # BƯỚC 1: LẤY TOÀN BỘ DATA CŨ TỪ DB RA ĐỂ SO KHỚP
+    # Mục đích: Biết được video nào đã tồn tại (kể cả link bẩn) để không tạo mới
+    try:
+        print("   - Đang load cache video từ Supabase...")
+        # Lấy id và video_url để đối chiếu
+        all_videos_db = supabase.table('videos').select('id, video_url').execute().data
+        
+        # Tạo Dictionary map: { 'VIDEO_ID_11_CHARS': {'id': 'uuid-...', 'original_url': '...'} }
+        db_cache = {}
+        for v in all_videos_db:
+            v_id = extract_video_id(v['video_url'])
+            if v_id:
+                db_cache[v_id] = {
+                    'id': v['id'],
+                    'original_url': v['video_url'] # Lưu lại link gốc (dù bẩn hay sạch)
+                }
+    except Exception as e:
+        print(f"❌ Lỗi load cache Supabase: {e}")
+        return
+
+    # Load Sheet
     try:
         sh = gc.open_by_key(SPREADSHEET_ID)
         ws = sh.worksheet('KOL PROGRESS')
@@ -79,14 +101,14 @@ def sync_progress_to_db():
         print(f"❌ Lỗi đọc sheet Progress: {e}")
         return
 
-    count_new = 0
+    count_processed = 0
     kols_map = {} 
 
     for row_idx, row in enumerate(records):
         kol_name = str(row.get('Name', '')).strip()
         if not kol_name: continue 
         
-        # --- 1. XỬ LÝ KOL ---
+        # --- XỬ LÝ KOL (Giữ nguyên) ---
         if kol_name not in kols_map:
             kol_data = {
                 'name': kol_name,
@@ -102,13 +124,13 @@ def sync_progress_to_db():
                     data = supabase.table('kols').select('id').eq('name', kol_name).execute().data
                     if data: kols_map[kol_name] = data[0]['id']
             except Exception as e:
-                print(f"⚠️ Lỗi xử lý KOL {kol_name}: {e}")
+                # print(f"⚠️ Lỗi xử lý KOL {kol_name}: {e}")
                 continue
         
         kol_id = kols_map.get(kol_name)
         if not kol_id: continue
 
-        # --- 2. XỬ LÝ VIDEO ---
+        # --- XỬ LÝ VIDEO (LOGIC MỚI FIX DUP) ---
         raw_report_link_cell = str(row.get('Report Link', ''))
         found_links = re.findall(r'(https?://[^\s,]+)', raw_report_link_cell)
         
@@ -120,29 +142,48 @@ def sync_progress_to_db():
         except: content_count = 0
 
         for raw_link in found_links:
+            # 1. Bóc tách ID từ link trên Sheet
             vid_id = extract_video_id(raw_link)
             
             if vid_id:
-                clean_url = f"https://www.youtube.com/watch?v={vid_id}"
+                # 2. CHECK TRONG DATABASE CŨ
+                existing_info = db_cache.get(vid_id)
                 
-                video_data = {
-                    'kol_id': kol_id,
-                    'video_url': clean_url,
-                    'agreement_link': agreement,
-                    'total_package': package,
-                    'content_count': content_count,
-                    'status': 'Active'
-                }
+                if existing_info:
+                    # TRƯỜNG HỢP 1: Video đã có trong DB (kể cả link bẩn)
+                    # -> Dùng lại UUID cũ và URL cũ để update metadata
+                    payload = {
+                        'id': existing_info['id'],            # QUAN TRỌNG: Key để update đúng dòng cũ
+                        'video_url': existing_info['original_url'], # QUAN TRỌNG: Giữ nguyên link cũ của mày
+                        'kol_id': kol_id,
+                        'agreement_link': agreement,
+                        'total_package': package,
+                        'content_count': content_count,
+                        'status': 'Active'
+                    }
+                else:
+                    # TRƯỜNG HỢP 2: Video hoàn toàn mới
+                    # -> Tạo link sạch và insert mới
+                    clean_url = f"https://www.youtube.com/watch?v={vid_id}"
+                    payload = {
+                        'video_url': clean_url,
+                        'kol_id': kol_id,
+                        'agreement_link': agreement,
+                        'total_package': package,
+                        'content_count': content_count,
+                        'status': 'Active'
+                    }
                 
                 try:
-                    supabase.table('videos').upsert(video_data, on_conflict='video_url').execute()
-                    count_new += 1
+                    # Upsert thông minh (Update nếu có ID, Insert nếu chưa)
+                    supabase.table('videos').upsert(payload, on_conflict='video_url').execute()
+                    count_processed += 1
                 except Exception as e:
-                    print(f"⚠️ Lỗi insert video {vid_id}: {e}")
+                    print(f"⚠️ Lỗi upsert video {vid_id}: {e}")
             else:
                 pass
 
-    print(f"✅ Đã đồng bộ metadata (tìm thấy và xử lý {count_new} link video).")
+    print(f"✅ Đã đồng bộ metadata (xử lý {count_processed} video, khớp ID thông minh).")
 
 # --- TASK 2: TRACK VIEW (YOUTUBE API -> DB) ---
 def track_youtube_views():
@@ -332,3 +373,4 @@ if __name__ == "__main__":
         print("\n🚀 ALL TASKS COMPLETED!")
     except Exception as e:
         print(f"\n❌ FATAL ERROR: {e}")
+
