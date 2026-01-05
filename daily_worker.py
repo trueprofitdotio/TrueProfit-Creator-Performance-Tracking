@@ -54,20 +54,22 @@ except Exception as e:
 
 # --- HELPER ---
 def extract_video_id(url):
+    """Lấy ID Youtube 11 ký tự"""
     if not isinstance(url, str): return None
     match = re.search(r'(?:v=|/|embed/|youtu\.be/)([\w-]{11})(?=&|\?|$)', url)
     return match.group(1) if match else None
 
 def parse_currency(value):
-    """Clean string currency to float (e.g., '$1,000' -> 1000.0)"""
+    """Chuyển đổi tiền tệ dạng text ($1,000) sang float (1000.0)"""
     try:
         # Giữ lại số và dấu chấm, loại bỏ , $ và chữ
         clean = re.sub(r'[^\d.]', '', str(value).replace(',', ''))
+        if not clean: return 0.0
         return float(clean)
     except:
         return 0.0
 
-# --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
+# --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE (ANTI-DUPLICATE) ---
 def sync_progress_to_db():
     print("\n>>> TASK 1: Syncing Metadata (Progress -> DB)...")
     
@@ -79,6 +81,7 @@ def sync_progress_to_db():
         for v in all_videos_db:
             v_id = extract_video_id(v['video_url'])
             if v_id:
+                # Cache lại ID và URL gốc (dù bẩn hay sạch)
                 db_cache[v_id] = {'id': v['id'], 'original_url': v['video_url']}
     except Exception as e:
         print(f"❌ Lỗi load cache Supabase: {e}")
@@ -134,11 +137,12 @@ def sync_progress_to_db():
             vid_id = extract_video_id(raw_link)
             if vid_id:
                 existing_info = db_cache.get(vid_id)
-                # Logic: Nếu video đã có -> Dùng lại ID & URL cũ. Nếu chưa -> Tạo mới.
+                
+                # Logic Anti-Duplicate: Nếu video đã có -> Dùng lại ID & URL cũ
                 if existing_info:
                     payload = {
                         'id': existing_info['id'],            
-                        'video_url': existing_info['original_url'], 
+                        'video_url': existing_info['original_url'], # Giữ nguyên link cũ
                         'kol_id': kol_id,
                         'agreement_link': agreement,
                         'total_package': package,
@@ -164,9 +168,9 @@ def sync_progress_to_db():
 
     print(f"✅ Đã đồng bộ metadata (xử lý {count_processed} video).")
 
-# --- TASK 2: TRACK VIEW & CALC CPM (YOUTUBE API -> DB) ---
+# --- TASK 2: TRACK VIEW (PURE TRACKING) ---
 def track_youtube_views():
-    print("\n>>> TASK 2: Tracking Views & Calculating CPM...")
+    print("\n>>> TASK 2: Tracking Views (Source of Truth)...")
     
     try:
         videos = supabase.table('videos').select('*').eq('status', 'Active').execute().data
@@ -209,31 +213,20 @@ def track_youtube_views():
 
                 db_vid = next((v for v in chunk if v['yt_id'] == yt_id), None)
                 if db_vid:
-                    # 1. Prepare Metrics
+                    # 1. Lưu Metrics (History)
                     metrics_insert.append({
                         'video_id': db_vid['id'],
                         'view_count': view_count,
                         'recorded_at': today_str 
                     })
 
-                    # 2. CALC CPM & Update Metadata
-                    # Công thức: CPM = (Total Package * 1000) / (View * Content Count)
-                    package_val = parse_currency(db_vid.get('total_package', 0))
-                    content_cnt = db_vid.get('content_count', 1)
-                    # Tránh chia cho 0
-                    if content_cnt == 0: content_cnt = 1
-                    
-                    cpm_value = 0.0
-                    if view_count > 0:
-                        cpm_value = (package_val * 1000) / (view_count * content_cnt)
-
+                    # 2. Update Metadata cơ bản (Không tính CPM ở đây nữa)
                     final_title = title if title else (db_vid.get('title') or db_vid.get('video_url'))
 
                     supabase.table('videos').update({
                         'title': final_title,
                         'released_date': published_at,
-                        'current_views': view_count,
-                        'current_cpm': cpm_value # Save calculated CPM to DB
+                        'current_views': view_count
                     }).eq('id', db_vid['id']).execute()
             
             if metrics_insert:
@@ -243,11 +236,11 @@ def track_youtube_views():
         except Exception as e:
             print(f"❌ Lỗi batch Youtube API: {e}")
 
-    print(f"✅ Đã update view & CPM cho {updated_count} videos.")
+    print(f"✅ Đã update view cho {updated_count} videos.")
 
-# --- TASK 3: BUILD DASHBOARD (DB -> SHEET FRONTEND) ---
+# --- TASK 3: BUILD DASHBOARD (CALC ON THE FLY) ---
 def build_dashboard():
-    print("\n>>> TASK 3: Building KOL DASHBOARD (Updated Columns)...")
+    print("\n>>> TASK 3: Building KOL DASHBOARD (Calculated CPM)...")
     
     # 1. Query Data
     try:
@@ -266,7 +259,7 @@ def build_dashboard():
     except: pass
 
     # 3. Build Rows
-    # Structure: [Title, KOL, Country, Released, Total View, View 7 Days, Growth, Current CPM, Agreement, Package, Content Count]
+    # Structure mới: [Title, KOL, Country, Released, Total View, View 7 Days, Growth, CPM, Agreement, Package, Content Count]
     headers = [
         'Video Title', 'KOL Name', 'Country', 'Released', 
         'Total Views', 'View (Last 7 Days)', 'Growth', 
@@ -278,13 +271,13 @@ def build_dashboard():
         video_url = item.get('video_url', '')
         video_id = item.get('id')
         
-        # Title Display
+        # Link & Title
         raw_title = item.get('title')
         display_title = raw_title if raw_title and str(raw_title).strip() != "" else video_url
         display_title = str(display_title).replace('"', '""') 
         title_cell = f'=HYPERLINK("{video_url}", "{display_title}")'
         
-        # Agreement Link
+        # Agreement
         agreement_link = item.get('agreement_link', '')
         agreement_cell = f'=HYPERLINK("{agreement_link}", "View Contract")' if agreement_link else "-"
 
@@ -293,17 +286,23 @@ def build_dashboard():
         kol_name = kol_info.get('name', 'Unknown')
         country = kol_info.get('country', '')
 
-        # Metrics
+        # --- TÍNH TOÁN ---
         current_views = item.get('current_views', 0) or 0
         old_views = history_map.get(video_id, 0) 
         growth_value = current_views - old_views
         
-        # CPM
-        cpm = item.get('current_cpm', 0) or 0
+        content_count = item.get('content_count', 0) or 0
         
-        # Content Count
-        content_count = item.get('content_count', 0)
-
+        # TÍNH CPM: (Total Package * 1000) / (Content Count * Total View)
+        package_val = parse_currency(item.get('total_package', 0)) # Chuyển '$1,500' -> 1500.0
+        
+        cpm = 0.0
+        # Mẫu số: Content Count * Views
+        denominator = content_count * current_views
+        
+        if denominator > 0:
+            cpm = (package_val * 1000) / denominator
+        
         row = [
             title_cell,
             kol_name,
@@ -312,10 +311,10 @@ def build_dashboard():
             current_views,  # E
             old_views,      # F
             growth_value,   # G
-            cpm,            # H (Current CPM)
+            cpm,            # H (Current CPM - Calculated)
             agreement_cell, # I
-            item.get('total_package'), # J
-            content_count   # K (Content Count - Last Column)
+            item.get('total_package'), # J (Display text gốc)
+            content_count   # K (Last Column)
         ]
         rows.append(row)
 
@@ -334,18 +333,18 @@ def build_dashboard():
         if rows:
             ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
             
-            # Format Number (Views): E, F, G
+            # Format Views: E, F, G
             ws.format(f'E2:G{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
             
-            # Format Number (CPM): H (2 decimal places)
+            # Format CPM: H (2 số lẻ)
             ws.format(f'H2:H{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
             
-            # Format Number (Content Count): K
+            # Format Content Count: K
             ws.format(f'K2:K{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}})
 
             ws.set_basic_filter(f'A1:K{len(rows)+1}') 
             
-        print("✅ Dashboard built successfully! (Added CPM & Content Count, Removed Status)")
+        print("✅ Dashboard built successfully! (CPM calculated on-the-fly, No Status column)")
     except Exception as e:
         print(f"❌ Lỗi ghi Google Sheet: {e}")
 
