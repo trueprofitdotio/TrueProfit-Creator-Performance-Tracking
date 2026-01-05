@@ -260,8 +260,12 @@ def update_metrics_and_dashboard():
                 }).eq('id', vid['id']).execute()
 
                 # --- Prepare Dashboard Row ---
-                # Link Formula
-                title_cell = f'=HYPERLINK("{vid["video_url"]}", "{str(display_title).replace("\"", "\"\"")}")'
+                # Bước 1: Xử lý escape dấu ngoặc kép cho Google Sheets/Excel formula trước
+                # (Thay thế 1 dấu " thành 2 dấu "" để không bị lỗi công thức)
+                sanitized_title = str(display_title).replace('"', '""')
+                
+                # Bước 2: Đưa biến đã xử lý vào f-string
+                title_cell = f'=HYPERLINK("{vid["video_url"]}", "{sanitized_title}")'
                 
                 # Agreement Formula
                 agree_link = vid.get('agreement_link', '')
@@ -324,3 +328,4 @@ if __name__ == "__main__":
         print("\n🚀 ALL PROCESS COMPLETED!")
     except Exception as e:
         print(f"\n❌ FATAL ERROR: {e}")
+
