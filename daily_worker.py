@@ -55,7 +55,6 @@ def get_gspread_client():
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gc = get_gspread_client()
 
-# --- HELPERS ---
 # --- CẬP NHẬT HELPER MẠNH MẼ HƠN ---
 def extract_video_id(url):
     """
@@ -245,55 +244,30 @@ def track_youtube_views():
 
 # --- TASK 3: BUILD DASHBOARD (DB -> SHEET FRONTEND) ---
 def build_dashboard():
-    print("\n>>> TASK 3: Building KOL DASHBOARD (Raw Data Mode)...")
+    print("\n>>> TASK 3: Building KOL DASHBOARD...")
     
-    # [FIX 1] Tự khởi tạo gspread client ngay trong hàm để tránh lỗi scope
+    # Query Data
     try:
-        gc = get_gspread_client()
-    except Exception as e:
-        print(f"❌ Lỗi Auth Google Sheet (gc): {e}")
-        return
-
-    # 1. Query Data Video & KOL
-    try:
-        print("   - Đang lấy data từ Supabase...")
         res = supabase.table('videos').select('*, kols(name, country, subscriber_count)').order('released_date', desc=True).execute()
         data = res.data
-        print(f"   - Tìm thấy {len(data)} videos.")
     except Exception as e:
         print(f"❌ Lỗi query Supabase Dashboard: {e}")
         return
 
-    # 2. Query Data History
-    try:
-        date_7_ago = (get_hanoi_time() - timedelta(days=7)).strftime('%Y-%m-%d')
-        metrics_res = supabase.table('video_metrics')\
-            .select('video_id, view_count')\
-            .eq('recorded_at', date_7_ago)\
-            .execute()
-        
-        history_map = {item['video_id']: item['view_count'] for item in metrics_res.data}
-    except Exception as e:
-        print(f"⚠️ Warning: Không lấy được history ({e}) -> Sẽ mặc định view cũ = 0")
-        history_map = {}
-
-    headers = [
-        'Video Title', 'KOL Name', 'Country', 'Released', 
-        'Total Views', 'View 7 Days Ago', 'Growth (7 Days)', 
-        'Agreement', 'Package', 'Status'
-    ]
+    headers = ['Video Title', 'KOL Name', 'Country', 'Released', 'Total Views', 'Growth (7 Days)', 'Agreement', 'Package', 'Status']
     rows = []
     
     for item in data:
+        # FIX: Xử lý Title rỗng -> Lấy URL
         raw_title = item.get('title')
         video_url = item.get('video_url', '')
-        video_id = item.get('id')
         
         display_title = raw_title if raw_title and str(raw_title).strip() != "" else video_url
-        display_title = str(display_title).replace('"', '""')
+        display_title = str(display_title).replace('"', '""') # Escape cho công thức
 
+        # Hyperlink Formula
         title_cell = f'=HYPERLINK("{video_url}", "{display_title}")'
-        
+
         agreement_link = item.get('agreement_link', '')
         agreement_cell = f'=HYPERLINK("{agreement_link}", "View Contract")' if agreement_link else "-"
 
@@ -301,45 +275,56 @@ def build_dashboard():
         kol_name = kol_info.get('name', 'Unknown')
         country = kol_info.get('country', '')
 
-        current_views = item.get('current_views', 0)
-        old_views = history_map.get(video_id, 0)
-        growth = current_views - old_views
+        views = item.get('current_views', 0)
+        growth = item.get('last_7_days_views', 0)
         
+        # Icon Growth
+        growth_display = f"{growth:,}" 
+        if growth > 0: growth_display = "🟢 +" + growth_display
+        elif growth == 0: growth_display = "⚪ " + growth_display
+        else: growth_display = "🔴 " + growth_display
+
         row = [
-            title_cell, kol_name, country, item.get('released_date'),
-            current_views, old_views, growth,
-            agreement_cell, item.get('total_package'), item.get('status')
+            title_cell,
+            kol_name,
+            country,
+            item.get('released_date'),
+            views,
+            growth_display,
+            agreement_cell,
+            item.get('total_package'),
+            item.get('status')
         ]
         rows.append(row)
 
-    # 4. Ghi vào Sheet
+    # Ghi vào Sheet
     try:
-        print("   - Đang ghi vào Google Sheet...")
         sh = gc.open_by_key(SPREADSHEET_ID)
         try:
             ws = sh.worksheet('KOL DASHBOARD')
             ws.clear()
         except:
-            print("   - Sheet 'KOL DASHBOARD' chưa có, đang tạo mới...")
             ws = sh.add_worksheet(title='KOL DASHBOARD', rows=1000, cols=20)
 
         ws.update(range_name='A1', values=[headers])
-        ws.format('A1:J1', {'textFormat': {'bold': True}, 'horizontalAlignment': 'CENTER', 'backgroundColor': {'red': 0.8, 'green': 0.8, 'blue': 0.8}})
+        ws.format('A1:I1', {'textFormat': {'bold': True}, 'horizontalAlignment': 'CENTER', 'backgroundColor': {'red': 0.8, 'green': 0.8, 'blue': 0.8}})
 
         if rows:
             ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
-            ws.format(f'E2:G{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+            ws.format(f'E2:E{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+            # Set filter
+            ws.set_basic_filter(f'A1:I{len(rows)+1}') 
             
-            # Format màu cho Growth (Xanh/Đỏ)
-            requests = [
-                {"addConditionalFormatRule": {"rule": {"ranges": [{"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": len(rows)+1, "startColumnIndex": 6, "endColumnIndex": 7}], "booleanRule": {"condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]}, "format": {"textFormat": {"foregroundColor": {"red": 0, "green": 0.6, "blue": 0}}}}}, "index": 0}},
-                {"addConditionalFormatRule": {"rule": {"ranges": [{"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": len(rows)+1, "startColumnIndex": 6, "endColumnIndex": 7}], "booleanRule": {"condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]}, "format": {"textFormat": {"foregroundColor": {"red": 1, "green": 0, "blue": 0}}}}}, "index": 1}}
-            ]
-            sh.batch_update({"requests": requests})
-            ws.set_basic_filter(f'A1:J{len(rows)+1}') 
-
-        print("✅ DONE! Vào Sheet check đi tml.")
+        print("✅ Dashboard built successfully!")
     except Exception as e:
-        print(f"❌ Chết đoạn ghi Sheet: {e}")
+        print(f"❌ Lỗi ghi Google Sheet: {e}")
 
-
+# --- MAIN ---
+if __name__ == "__main__":
+    try:
+        sync_progress_to_db()
+        track_youtube_views()
+        build_dashboard()
+        print("\n🚀 ALL TASKS COMPLETED!")
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR: {e}")
