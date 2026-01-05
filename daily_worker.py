@@ -244,9 +244,9 @@ def track_youtube_views():
 
 # --- TASK 3: BUILD DASHBOARD (DB -> SHEET FRONTEND) ---
 def build_dashboard():
-    print("\n>>> TASK 3: Building KOL DASHBOARD...")
+    print("\n>>> TASK 3: Building KOL DASHBOARD (Raw Data & History)...")
     
-    # Query Data
+    # 1. Query Data Video & KOL (Lấy video mới nhất lên đầu)
     try:
         res = supabase.table('videos').select('*, kols(name, country, subscriber_count)').order('released_date', desc=True).execute()
         data = res.data
@@ -254,13 +254,37 @@ def build_dashboard():
         print(f"❌ Lỗi query Supabase Dashboard: {e}")
         return
 
-    headers = ['Video Title', 'KOL Name', 'Country', 'Released', 'Total Views', 'Growth (7 Days)', 'Agreement', 'Package', 'Status']
+    # 2. Query Data History (View 7 ngày trước) - QUERY 1 LẦN DUY NHẤT
+    # Logic: Tìm record trong video_metrics có recorded_at = hôm nay - 7 ngày
+    history_map = {}
+    try:
+        date_7_ago = (get_hanoi_time() - timedelta(days=7)).strftime('%Y-%m-%d')
+        print(f"📅 Đang lấy dữ liệu view lịch sử ngày: {date_7_ago}")
+
+        metrics_res = supabase.table('video_metrics')\
+            .select('video_id, view_count')\
+            .eq('recorded_at', date_7_ago)\
+            .execute()
+        
+        # Map ID -> View cũ để tra cứu cho lẹ
+        history_map = {item['video_id']: item['view_count'] for item in metrics_res.data}
+    except Exception as e:
+        print(f"⚠️ Warning: Không lấy được history ({e}) -> Coi như view cũ = 0")
+
+    # 3. Build Rows
+    # Cấu trúc cột mới: Total Views | View 7 Days Ago | Growth
+    headers = [
+        'Video Title', 'KOL Name', 'Country', 'Released', 
+        'Total Views', 'View 7 Days Ago', 'Growth (7 Days)', 
+        'Agreement', 'Package', 'Status'
+    ]
     rows = []
     
     for item in data:
-        # FIX: Xử lý Title rỗng -> Lấy URL
+        # Xử lý Title rỗng -> Lấy URL
         raw_title = item.get('title')
         video_url = item.get('video_url', '')
+        video_id = item.get('id')
         
         display_title = raw_title if raw_title and str(raw_title).strip() != "" else video_url
         display_title = str(display_title).replace('"', '""') # Escape cho công thức
@@ -275,56 +299,81 @@ def build_dashboard():
         kol_name = kol_info.get('name', 'Unknown')
         country = kol_info.get('country', '')
 
-        views = item.get('current_views', 0)
-        growth = item.get('last_7_days_views', 0)
+        # --- XỬ LÝ SỐ LIỆU ---
+        current_views = item.get('current_views', 0) or 0 # Đảm bảo là int
+        old_views = history_map.get(video_id, 0) # Lấy từ map lịch sử
         
-        # Icon Growth
-        growth_display = f"{growth:,}" 
-        if growth > 0: growth_display = "🟢 +" + growth_display
-        elif growth == 0: growth_display = "⚪ " + growth_display
-        else: growth_display = "🔴 " + growth_display
+        # Tính Growth: Số thô, không icon
+        growth_value = current_views - old_views
 
         row = [
             title_cell,
             kol_name,
             country,
             item.get('released_date'),
-            views,
-            growth_display,
+            current_views,  # Cột E
+            old_views,      # Cột F (Mới)
+            growth_value,   # Cột G (Số thô)
             agreement_cell,
             item.get('total_package'),
             item.get('status')
         ]
         rows.append(row)
 
-    # Ghi vào Sheet
+    # 4. Ghi vào Sheet
     try:
         sh = gc.open_by_key(SPREADSHEET_ID)
         try:
             ws = sh.worksheet('KOL DASHBOARD')
-            ws.clear()
+            ws.clear() # Xóa sạch cũ
         except:
             ws = sh.add_worksheet(title='KOL DASHBOARD', rows=1000, cols=20)
 
+        # Update Header
         ws.update(range_name='A1', values=[headers])
-        ws.format('A1:I1', {'textFormat': {'bold': True}, 'horizontalAlignment': 'CENTER', 'backgroundColor': {'red': 0.8, 'green': 0.8, 'blue': 0.8}})
+        # Format Header
+        ws.format('A1:J1', {'textFormat': {'bold': True}, 'horizontalAlignment': 'CENTER', 'backgroundColor': {'red': 0.8, 'green': 0.8, 'blue': 0.8}})
 
         if rows:
+            # Ghi dữ liệu
             ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
-            ws.format(f'E2:E{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
-            # Set filter
-            ws.set_basic_filter(f'A1:I{len(rows)+1}') 
             
-        print("✅ Dashboard built successfully!")
+            # Format số (có dấu phẩy) cho 3 cột E, F, G
+            ws.format(f'E2:G{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+            
+            # --- CONDITIONAL FORMATTING CHO CỘT GROWTH (G) ---
+            # Xanh nếu > 0, Đỏ nếu < 0
+            requests = [
+                {
+                    "addConditionalFormatRule": {
+                        "rule": {
+                            "ranges": [{"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": len(rows)+1, "startColumnIndex": 6, "endColumnIndex": 7}],
+                            "booleanRule": {
+                                "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
+                                "format": {"textFormat": {"foregroundColor": {"red": 0, "green": 0.6, "blue": 0}}}
+                            }
+                        },
+                        "index": 0
+                    }
+                },
+                {
+                    "addConditionalFormatRule": {
+                        "rule": {
+                            "ranges": [{"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": len(rows)+1, "startColumnIndex": 6, "endColumnIndex": 7}],
+                            "booleanRule": {
+                                "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
+                                "format": {"textFormat": {"foregroundColor": {"red": 1, "green": 0, "blue": 0}}}
+                            }
+                        },
+                        "index": 1
+                    }
+                }
+            ]
+            sh.batch_update({"requests": requests})
+            
+            # Set filter
+            ws.set_basic_filter(f'A1:J{len(rows)+1}') 
+            
+        print("✅ Dashboard updated successfully with History & Raw Metrics!")
     except Exception as e:
         print(f"❌ Lỗi ghi Google Sheet: {e}")
-
-# --- MAIN ---
-if __name__ == "__main__":
-    try:
-        sync_progress_to_db()
-        track_youtube_views()
-        build_dashboard()
-        print("\n🚀 ALL TASKS COMPLETED!")
-    except Exception as e:
-        print(f"\n❌ FATAL ERROR: {e}")
