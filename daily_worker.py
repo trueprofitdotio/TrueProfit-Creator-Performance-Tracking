@@ -5,7 +5,6 @@ import os
 import json
 import base64
 import requests
-import time
 from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 from google.oauth2.credentials import Credentials
@@ -13,36 +12,43 @@ from google.auth.transport.requests import Request
 
 # --- CẤU HÌNH ---
 SPREADSHEET_ID = '15Q7_YzBYMjCceBB5-yi51noA0d03oqRIcd-icDvCdqI'
-SHEET_NAME_SOURCE = 'KOL PROGRESS'
-SHEET_NAME_DASHBOARD = 'KOL DASHBOARD'
 
-# Env Variables
+# Lấy từ biến môi trường (Github) hoặc hardcode (Local)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://wpzigasfuizrabqqzxln.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_tPw7wEcEku1sVGVITE2X7A_MNtKlCww")
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyChr_rRRYlsH9_wfY8JB1UJ30fPDMBtp0c")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyChr_rRRYlsH9_wfY8JB1UJ30fPDMBtp0c") # Thay key của mày vào
 
-# --- AUTH SETUP ---
+# --- MÚI GIỜ HÀ NỘI (GMT+7) ---
 def get_hanoi_time():
+    # Tạo timezone GMT+7
     tz_vn = timezone(timedelta(hours=7))
     return datetime.now(tz_vn)
 
+# --- AUTHENTICATION ---
 def get_gspread_client():
     SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+    
+    # 1. Ưu tiên lấy từ Github Secret (Base64)
     if os.environ.get("TOKEN_JSON_BASE64"):
-        print("🔑 Auth: Using Github Secret Token...")
+        print("🔑 Đang dùng Token từ Github Secret...")
         try:
-            token_json = base64.b64decode(os.environ.get("TOKEN_JSON_BASE64")).decode('utf-8')
-            creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+            token_json_str = base64.b64decode(os.environ.get("TOKEN_JSON_BASE64")).decode('utf-8')
+            token_info = json.loads(token_json_str)
+            creds = Credentials.from_authorized_user_info(token_info, SCOPES)
         except Exception as e:
-            raise Exception(f"❌ Token Error: {e}")
+            raise Exception(f"❌ Lỗi decode token base64: {e}")
+            
+    # 2. Nếu không có thì tìm file local
     elif os.path.exists('token.json'):
-        print("🔑 Auth: Using Local token.json...")
+        print("🔑 Đang dùng Token từ file Local...")
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
     else:
-        raise Exception("❌ No auth token found!")
+        raise Exception("❌ Không tìm thấy Token đăng nhập (token.json hoặc ENV Var)!")
 
+    # Auto refresh token nếu hết hạn
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
+
     return gspread.authorize(creds)
 
 # Init Clients
@@ -50,282 +56,276 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gc = get_gspread_client()
 
 # --- HELPERS ---
+# --- CẬP NHẬT HELPER MẠNH MẼ HƠN ---
 def extract_video_id(url):
-    """Lấy YouTube ID chuẩn từ mọi định dạng link"""
+    """
+    Trích xuất Video ID từ mọi thể loại link Youtube (ngắn, dài, embed, dính tham số...)
+    """
     if not isinstance(url, str): return None
-    match = re.search(r'(?:v=|\/|youtu\.be\/)([\w-]{11})(?=&|\?|$)', url)
+    # Regex bắt ID 11 ký tự, chấp nhận cả dấu gạch ngang (-) và gạch dưới (_)
+    # Bắt các dạng: youtube.com/watch?v=ID, youtu.be/ID, youtube.com/embed/ID
+    match = re.search(r'(?:v=|/|embed/|youtu\.be/)([\w-]{11})(?=&|\?|$)', url)
     return match.group(1) if match else None
 
-def extract_all_links(text_blob):
-    """Tách tất cả link từ cell, handle xuống dòng, dấu phẩy..."""
-    if not text_blob: return []
-    # Regex bắt link http/https kết thúc trước khoảng trắng hoặc dấu câu
-    return re.findall(r'(https?://[^\s,;"\']+)', str(text_blob))
-
-def get_youtube_details(video_id):
-    """Gọi API lấy Title và Date"""
-    if not video_id: return None, None
-    try:
-        url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet&id={video_id}&key={YOUTUBE_API_KEY}"
-        res = requests.get(url).json()
-        if 'items' in res and len(res['items']) > 0:
-            snippet = res['items'][0]['snippet']
-            title = snippet.get('title', '')
-            published_at = snippet.get('publishedAt', '').split('T')[0] # Lấy YYYY-MM-DD
-            return title, published_at
-    except Exception as e:
-        print(f"⚠️ YouTube API Error ({video_id}): {e}")
-    return None, None
-
-# --- TASK 1: SYNC NEW VIDEOS (PROGRESS -> SUPABASE) ---
+# --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE (OPTIMIZED) ---
 def sync_progress_to_db():
-    print("\n>>> TASK 1: Scanning for NEW videos in 'KOL PROGRESS'...")
-    
-    # 1. Lấy danh sách video hiện có trên DB để so sánh (tránh query lặp)
-    try:
-        existing_res = supabase.table('videos').select('video_url').execute()
-        existing_urls = {item['video_url'] for item in existing_res.data}
-        print(f"📚 Database hiện có: {len(existing_urls)} videos.")
-    except Exception as e:
-        print(f"❌ Error fetching existing videos: {e}")
-        return
-
-    # 2. Đọc Google Sheet
+    print("\n>>> TASK 1: Syncing Metadata (Progress -> DB) - CLEAN VERSION...")
     try:
         sh = gc.open_by_key(SPREADSHEET_ID)
-        ws = sh.worksheet(SHEET_NAME_SOURCE)
-        rows = ws.get_all_values() # Lấy toàn bộ data dạng mảng
-        # Headers: No(0), Email(1), Name(2), Channel(3), Loc(4), Sub(5), Agreement(6), Package(7), ..., Report Link(11)
+        ws = sh.worksheet('KOL PROGRESS')
+        records = ws.get_all_records()
     except Exception as e:
-        print(f"❌ Error reading sheet: {e}")
+        print(f"❌ Lỗi đọc sheet Progress: {e}")
         return
 
-    new_videos_count = 0
-    kol_cache = {} # Cache Name -> ID
+    count_new = 0
+    kols_map = {} # Cache KOL ID để đỡ gọi DB nhiều lần
 
-    # Bỏ qua dòng header (index 0)
-    for i, row in enumerate(rows[1:], start=2):
-        # Safety check độ dài row
-        if len(row) < 12: continue
-
-        kol_name = row[2].strip() # Cột C
-        raw_links = row[11].strip() # Cột L (Report Link)
+    for row_idx, row in enumerate(records):
+        kol_name = str(row.get('Name', '')).strip()
+        if not kol_name: continue # Bỏ qua dòng trống tên
         
-        # Nếu không có tên KOL hoặc không có link -> Skip
-        if not kol_name or not raw_links: continue
-
-        # Tách link (xử lý cell có nhiều link)
-        links = extract_all_links(raw_links)
-        
-        for link in links:
-            clean_link = link.strip()
-            
-            # --- CHECK: Nếu link đã có trong DB -> BỎ QUA ---
-            if clean_link in existing_urls:
-                continue
-
-            print(f"⚡ Phát hiện video mới: {clean_link}")
-            
-            # --- START PROCESS NEW VIDEO ---
-            vid_id_yt = extract_video_id(clean_link)
-            if not vid_id_yt: continue
-
-            # A. Xử lý KOL (Upsert & Get ID)
-            kol_id = kol_cache.get(kol_name)
-            if not kol_id:
-                # Map thông tin KOL từ row hiện tại
-                kol_data = {
-                    'name': kol_name,
-                    'email': row[1].strip(),           # Cột B
-                    'country': row[4].strip(),         # Cột E
-                    'subscriber_count': row[5].strip() # Cột F
-                }
-                try:
-                    res = supabase.table('kols').upsert(kol_data, on_conflict='name').select().execute()
-                    if res.data:
-                        kol_id = res.data[0]['id']
-                    else:
-                        # Fallback select nếu upsert không trả data
-                        res = supabase.table('kols').select('id').eq('name', kol_name).execute()
-                        kol_id = res.data[0]['id']
-                    kol_cache[kol_name] = kol_id
-                except Exception as e:
-                    print(f"⚠️ Lỗi KOL {kol_name}: {e}")
-                    continue
-
-            # B. Gọi API lấy thông tin Video (Title, Date)
-            yt_title, yt_date = get_youtube_details(vid_id_yt)
-            
-            # Nếu API fail, dùng tạm tên file/ngày hiện tại (để sửa sau)
-            final_title = yt_title if yt_title else f"Video {vid_id_yt}"
-            final_date = yt_date if yt_date else get_hanoi_time().strftime('%Y-%m-%d')
-
-            # C. Insert Video vào DB
-            video_data = {
-                'kol_id': kol_id,
-                'video_url': clean_link,
-                'title': final_title,
-                'released_date': final_date,
-                'agreement_link': row[6].strip(), # Cột G
-                'total_package': row[7].strip(),  # Cột H
-                'status': 'Active'
+        # --- 1. XỬ LÝ KOL ---
+        # Kiểm tra cache trước, nếu chưa có thì Upsert lấy ID
+        if kol_name not in kols_map:
+            kol_data = {
+                'name': kol_name,
+                'email': row.get('Email', ''),
+                'country': row.get('Location', ''),
+                'subscriber_count': str(row.get('Subscriber/Follower', ''))
             }
-            
             try:
-                supabase.table('videos').upsert(video_data, on_conflict='video_url').execute()
-                existing_urls.add(clean_link) # Add vào cache local để không add trùng trong cùng 1 lần chạy
-                new_videos_count += 1
-                print(f"✅ Đã thêm video: {final_title}")
+                res = supabase.table('kols').upsert(kol_data, on_conflict='name').execute()
+                if res.data:
+                    kols_map[kol_name] = res.data[0]['id']
+                else:
+                    # Fallback nếu upsert không trả data (hiếm)
+                    data = supabase.table('kols').select('id').eq('name', kol_name).execute().data
+                    if data: kols_map[kol_name] = data[0]['id']
             except Exception as e:
-                print(f"❌ Lỗi insert video: {e}")
+                print(f"⚠️ Lỗi xử lý KOL {kol_name}: {e}")
+                continue
+        
+        kol_id = kols_map.get(kol_name)
+        if not kol_id: continue
 
-    print(f"\n📊 TỔNG KẾT TASK 1: Đã sync thành công {new_videos_count} video mới.")
+        # --- 2. XỬ LÝ VIDEO (LOGIC MỚI) ---
+        raw_report_link_cell = str(row.get('Report Link', ''))
+        
+        # Dùng Regex để tìm TẤT CẢ các link có trong ô (bất chấp Alt+Enter, dấu cách, dấu phẩy)
+        # Pattern này bắt chuỗi bắt đầu bằng http/https và kết thúc khi gặp khoảng trắng/xuống dòng
+        found_links = re.findall(r'(https?://[^\s,]+)', raw_report_link_cell)
+        
+        agreement = row.get('Signed Agreement', '')
+        package = str(row.get('Total Package', ''))
+        try:
+            raw_count = row.get('No. Of Content', 0)
+            content_count = int(str(raw_count).replace(',', '').strip()) if raw_count else 0
+        except: content_count = 0
 
-# --- TASK 2: UPDATE VIEW & DASHBOARD (DB -> SHEET DASHBOARD) ---
-def update_metrics_and_dashboard():
-    print("\n>>> TASK 2: Updating Views & Dashboard...")
+        for raw_link in found_links:
+            # BƯỚC QUAN TRỌNG: Chỉ lấy ID và tạo link sạch
+            vid_id = extract_video_id(raw_link)
+            
+            if vid_id:
+                # Tái tạo link chuẩn -> Tránh duplicate do tham số rác (&t=...)
+                clean_url = f"https://www.youtube.com/watch?v={vid_id}"
+                
+                video_data = {
+                    'kol_id': kol_id,
+                    'video_url': clean_url, # Lưu link sạch vào DB
+                    'agreement_link': agreement,
+                    'total_package': package,
+                    'content_count': content_count,
+                    'status': 'Active'
+                }
+                
+                try:
+                    # Upsert vào DB
+                    supabase.table('videos').upsert(video_data, on_conflict='video_url').execute()
+                    count_new += 1
+                except Exception as e:
+                    print(f"⚠️ Lỗi insert video {vid_id}: {e}")
+            else:
+                # Link không đúng định dạng Youtube -> Bỏ qua hoặc log nhẹ
+                pass
+
+    print(f"✅ Đã đồng bộ metadata (tìm thấy và xử lý {count_new} link video).")
+# --- TASK 2: TRACK VIEW (YOUTUBE API -> DB) ---
+def track_youtube_views():
+    print("\n>>> TASK 2: Tracking Youtube Views...")
     
-    # 1. Lấy tất cả video Active từ DB
+    # Lấy list video Active
     try:
-        # Join bảng kols để lấy tên hiển thị dashboard
-        videos = supabase.table('videos').select('*, kols(name, country)').eq('status', 'Active').order('released_date', desc=True).execute().data
+        videos = supabase.table('videos').select('*').eq('status', 'Active').execute().data
     except Exception as e:
         print(f"❌ Lỗi đọc Supabase: {e}")
         return
+    
+    valid_videos = []
+    for v in videos:
+        vid = extract_video_id(v['video_url'])
+        if vid:
+            v['yt_id'] = vid
+            valid_videos.append(v)
+    
+    print(f"🔍 Scan {len(valid_videos)} videos...")
 
-    # Lọc video có ID youtube hợp lệ
-    valid_videos = [v for v in videos if extract_video_id(v['video_url'])]
-    print(f"🔍 Đang check view cho {len(valid_videos)} videos...")
-
-    # 2. Batch Request Youtube API (50 id/lần)
     chunk_size = 50
-    now_str = get_hanoi_time().strftime('%Y-%m-%d')
-    date_7_ago = (get_hanoi_time() - timedelta(days=7)).strftime('%Y-%m-%d')
+    # FIX: Lấy ngày theo giờ Hà Nội (GMT+7)
+    now_vn = get_hanoi_time()
+    today_str = now_vn.strftime('%Y-%m-%d') 
     
-    rows_for_dashboard = []
-    
+    updated_count = 0
+
     for i in range(0, len(valid_videos), chunk_size):
         chunk = valid_videos[i:i+chunk_size]
-        ids_str = ",".join([extract_video_id(v['video_url']) for v in chunk])
+        ids = ",".join([v['yt_id'] for v in chunk])
         
         try:
-            url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id={ids_str}&key={YOUTUBE_API_KEY}"
+            url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id={ids}&key={YOUTUBE_API_KEY}"
             res = requests.get(url).json()
-            api_map = {item['id']: item for item in res.get('items', [])}
             
-            metrics_upsert = []
+            metrics_insert = []
+            
+            for item in res.get('items', []):
+                yt_id = item['id']
+                stats = item['statistics']
+                snippet = item['snippet']
+                
+                view_count = int(stats.get('viewCount', 0))
+                title = snippet.get('title', '')
+                published_at = snippet.get('publishedAt', '').split('T')[0]
 
-            for vid in chunk:
-                vid_id_yt = extract_video_id(vid['video_url'])
-                yt_data = api_map.get(vid_id_yt)
-                
-                # Default values (nếu video bị xóa/private)
-                current_view = vid.get('current_views', 0)
-                display_title = vid.get('title', vid['video_url'])
-                
-                if yt_data:
-                    current_view = int(yt_data['statistics'].get('viewCount', 0))
-                    # Tiện thể update luôn title nếu DB đang sai/cũ
-                    api_title = yt_data['snippet'].get('title')
-                    if api_title: display_title = api_title
-                
-                # --- Tính Growth ---
-                # Lấy view count của 7 ngày trước từ bảng history (video_metrics)
-                # Query này nằm trong loop nên hơi chậm, nhưng chính xác. 
-                # Có thể tối ưu sau bằng batch query metrics.
-                try:
+                # Map với DB
+                db_vid = next((v for v in chunk if v['yt_id'] == yt_id), None)
+                if db_vid:
+                    # 1. Chuẩn bị data Metrics (Lịch sử hôm nay)
+                    metrics_insert.append({
+                        'video_id': db_vid['id'],
+                        'view_count': view_count,
+                        'recorded_at': today_str 
+                        # created_at sẽ tự động lấy giờ server (UTC), ko cần chỉnh
+                    })
+
+                    # 2. Tính Growth (So với 7 ngày trước)
+                    # Logic: Lấy ngày hiện tại - 7 ngày
+                    date_7_ago = (now_vn - timedelta(days=7)).strftime('%Y-%m-%d')
+                    
                     hist = supabase.table('video_metrics').select('view_count')\
-                        .eq('video_id', vid['id']).eq('recorded_at', date_7_ago).execute()
-                    view_last_week = hist.data[0]['view_count'] if hist.data else current_view
-                except:
-                    view_last_week = current_view
-                
-                # Nếu video mới < 7 ngày, last week coi như = 0 hoặc logic tuỳ ý
-                # Logic: View Last Week là số view tại thời điểm 7 ngày trước.
-                # Growth = Current - Last Week
-                growth = current_view - view_last_week
-                
-                # --- Prepare Data Sync ---
-                metrics_upsert.append({
-                    'video_id': vid['id'],
-                    'view_count': current_view,
-                    'recorded_at': now_str
-                })
-                
-                # Update lại Main Table
-                supabase.table('videos').update({
-                    'current_views': current_view,
-                    'last_7_days_views': growth,
-                    'title': display_title
-                }).eq('id', vid['id']).execute()
+                        .eq('video_id', db_vid['id'])\
+                        .eq('recorded_at', date_7_ago)\
+                        .execute()
+                    
+                    # Nếu tìm thấy view cũ thì trừ, ko thì coi growth = 0 (hoặc bằng view hiện tại nếu là video mới tinh)
+                    view_7_days_ago = hist.data[0]['view_count'] if hist.data else view_count
+                    growth = view_count - view_7_days_ago
 
-                # --- Prepare Dashboard Row ---
-                # Bước 1: Xử lý escape dấu ngoặc kép cho Google Sheets/Excel formula trước
-                # (Thay thế 1 dấu " thành 2 dấu "" để không bị lỗi công thức)
-                sanitized_title = str(display_title).replace('"', '""')
-                
-                # Bước 2: Đưa biến đã xử lý vào f-string
-                title_cell = f'=HYPERLINK("{vid["video_url"]}", "{sanitized_title}")'
-                
-                # Agreement Formula
-                agree_link = vid.get('agreement_link', '')
-                agree_cell = f'=HYPERLINK("{agree_link}", "View Contract")' if agree_link else "-"
+                    # 3. Update Cache & Metadata vào bảng Videos
+                    # Logic title: Nếu API trả về rỗng, giữ nguyên cũ, hoặc dùng URL
+                    final_title = title if title else (db_vid.get('title') or db_vid.get('video_url'))
 
-                kol_name = vid['kols']['name'] if vid.get('kols') else 'Unknown'
-
-                row = [
-                    title_cell,         # A: Video Title
-                    kol_name,           # B: KOL Name
-                    vid['released_date'], # C: Released Date
-                    vid.get('content_count', 0), # D (Optional)
-                    current_view,       # E: Current Views
-                    view_last_week,     # F: View Last Week
-                    growth,             # G: Growth
-                    agree_cell,         # H: Agreement
-                    vid.get('total_package'), # I: Package
-                    vid.get('status')   # J: Status
-                ]
-                rows_for_dashboard.append(row)
+                    supabase.table('videos').update({
+                        'title': final_title,
+                        'released_date': published_at,
+                        'current_views': view_count,
+                        'last_7_days_views': growth
+                    }).eq('id', db_vid['id']).execute()
             
-            # Batch upsert metrics history
-            if metrics_upsert:
-                supabase.table('video_metrics').upsert(metrics_upsert, on_conflict='video_id,recorded_at').execute()
-                
-        except Exception as e:
-            print(f"❌ API Batch Error: {e}")
+            if metrics_insert:
+                # FIX: Upsert dựa trên (video_id, recorded_at)
+                # Đảm bảo 1 ngày chỉ có 1 dòng, chạy lại sẽ update view
+                supabase.table('video_metrics').upsert(metrics_insert, on_conflict='video_id,recorded_at').execute()
+                updated_count += len(metrics_insert)
 
-    # 3. Ghi ra Sheet Dashboard
-    if rows_for_dashboard:
+        except Exception as e:
+            print(f"❌ Lỗi batch Youtube API: {e}")
+
+    print(f"✅ Đã update view cho {updated_count} videos (Ngày recorded: {today_str}).")
+
+# --- TASK 3: BUILD DASHBOARD (DB -> SHEET FRONTEND) ---
+def build_dashboard():
+    print("\n>>> TASK 3: Building KOL DASHBOARD...")
+    
+    # Query Data
+    try:
+        res = supabase.table('videos').select('*, kols(name, country, subscriber_count)').order('released_date', desc=True).execute()
+        data = res.data
+    except Exception as e:
+        print(f"❌ Lỗi query Supabase Dashboard: {e}")
+        return
+
+    headers = ['Video Title', 'KOL Name', 'Country', 'Released', 'Total Views', 'Growth (7 Days)', 'Agreement', 'Package', 'Status']
+    rows = []
+    
+    for item in data:
+        # FIX: Xử lý Title rỗng -> Lấy URL
+        raw_title = item.get('title')
+        video_url = item.get('video_url', '')
+        
+        display_title = raw_title if raw_title and str(raw_title).strip() != "" else video_url
+        display_title = str(display_title).replace('"', '""') # Escape cho công thức
+
+        # Hyperlink Formula
+        title_cell = f'=HYPERLINK("{video_url}", "{display_title}")'
+
+        agreement_link = item.get('agreement_link', '')
+        agreement_cell = f'=HYPERLINK("{agreement_link}", "View Contract")' if agreement_link else "-"
+
+        kol_info = item.get('kols', {}) or {}
+        kol_name = kol_info.get('name', 'Unknown')
+        country = kol_info.get('country', '')
+
+        views = item.get('current_views', 0)
+        growth = item.get('last_7_days_views', 0)
+        
+        # Icon Growth
+        growth_display = f"{growth:,}" 
+        if growth > 0: growth_display = "🟢 +" + growth_display
+        elif growth == 0: growth_display = "⚪ " + growth_display
+        else: growth_display = "🔴 " + growth_display
+
+        row = [
+            title_cell,
+            kol_name,
+            country,
+            item.get('released_date'),
+            views,
+            growth_display,
+            agreement_cell,
+            item.get('total_package'),
+            item.get('status')
+        ]
+        rows.append(row)
+
+    # Ghi vào Sheet
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
         try:
-            sh = gc.open_by_key(SPREADSHEET_ID)
-            try:
-                ws = sh.worksheet(SHEET_NAME_DASHBOARD)
-                ws.clear()
-            except:
-                ws = sh.add_worksheet(title=SHEET_NAME_DASHBOARD, rows=1000, cols=20)
+            ws = sh.worksheet('KOL DASHBOARD')
+            ws.clear()
+        except:
+            ws = sh.add_worksheet(title='KOL DASHBOARD', rows=1000, cols=20)
+
+        ws.update(range_name='A1', values=[headers])
+        ws.format('A1:I1', {'textFormat': {'bold': True}, 'horizontalAlignment': 'CENTER', 'backgroundColor': {'red': 0.8, 'green': 0.8, 'blue': 0.8}})
+
+        if rows:
+            ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
+            ws.format(f'E2:E{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+            # Set filter
+            ws.set_basic_filter(f'A1:I{len(rows)+1}') 
             
-            headers = ['Video Title', 'KOL Name', 'Released Date', 'Content #', 'Current Views', 'View Last Week', 'Growth (7d)', 'Agreement', 'Package', 'Status']
-            
-            ws.update(range_name='A1', values=[headers])
-            ws.format('A1:J1', {'textFormat': {'bold': True}, 'horizontalAlignment': 'CENTER', 'backgroundColor': {'red': 0.8, 'green': 0.8, 'blue': 0.8}})
-            
-            ws.update(range_name='A2', values=rows_for_dashboard, value_input_option='USER_ENTERED')
-            
-            # Format Numbers (View columns E, F, G)
-            ws.format(f'E2:G{len(rows_for_dashboard)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
-            ws.columns_auto_resize(0, 9)
-            ws.set_basic_filter(f'A1:J{len(rows_for_dashboard)+1}')
-            
-            print("✅ Dashboard updated successfully!")
-        except Exception as e:
-            print(f"❌ Error writing to Sheet: {e}")
+        print("✅ Dashboard built successfully!")
+    except Exception as e:
+        print(f"❌ Lỗi ghi Google Sheet: {e}")
 
 # --- MAIN ---
 if __name__ == "__main__":
     try:
         sync_progress_to_db()
-        update_metrics_and_dashboard()
-        print("\n🚀 ALL PROCESS COMPLETED!")
+        track_youtube_views()
+        build_dashboard()
+        print("\n🚀 ALL TASKS COMPLETED!")
     except Exception as e:
         print(f"\n❌ FATAL ERROR: {e}")
-
