@@ -62,7 +62,6 @@ def extract_video_id(url):
 def parse_currency(value):
     """Chuyển đổi tiền tệ dạng text ($1,000) sang float (1000.0)"""
     try:
-        # Giữ lại số và dấu chấm, loại bỏ , $ và chữ
         clean = re.sub(r'[^\d.]', '', str(value).replace(',', ''))
         if not clean: return 0.0
         return float(clean)
@@ -73,7 +72,7 @@ def parse_currency(value):
 def sync_progress_to_db():
     print("\n>>> TASK 1: Syncing Metadata (Progress -> DB)...")
     
-    # 1. Load cache video cũ để check duplicate logic
+    # 1. Load cache video cũ
     try:
         print("   - Đang load cache video từ Supabase...")
         all_videos_db = supabase.table('videos').select('id, video_url').execute().data
@@ -81,7 +80,6 @@ def sync_progress_to_db():
         for v in all_videos_db:
             v_id = extract_video_id(v['video_url'])
             if v_id:
-                # Cache lại ID và URL gốc (dù bẩn hay sạch)
                 db_cache[v_id] = {'id': v['id'], 'original_url': v['video_url']}
     except Exception as e:
         print(f"❌ Lỗi load cache Supabase: {e}")
@@ -125,7 +123,6 @@ def sync_progress_to_db():
         # Upsert Video
         raw_report_link_cell = str(row.get('Report Link', ''))
         found_links = re.findall(r'(https?://[^\s,]+)', raw_report_link_cell)
-        
         agreement = row.get('Signed Agreement', '')
         package = str(row.get('Total Package', ''))
         try:
@@ -137,12 +134,10 @@ def sync_progress_to_db():
             vid_id = extract_video_id(raw_link)
             if vid_id:
                 existing_info = db_cache.get(vid_id)
-                
-                # Logic Anti-Duplicate: Nếu video đã có -> Dùng lại ID & URL cũ
                 if existing_info:
                     payload = {
                         'id': existing_info['id'],            
-                        'video_url': existing_info['original_url'], # Giữ nguyên link cũ
+                        'video_url': existing_info['original_url'],
                         'kol_id': kol_id,
                         'agreement_link': agreement,
                         'total_package': package,
@@ -159,7 +154,6 @@ def sync_progress_to_db():
                         'content_count': content_count,
                         'status': 'Active'
                     }
-                
                 try:
                     supabase.table('videos').upsert(payload, on_conflict='video_url').execute()
                     count_processed += 1
@@ -168,9 +162,9 @@ def sync_progress_to_db():
 
     print(f"✅ Đã đồng bộ metadata (xử lý {count_processed} video).")
 
-# --- TASK 2: TRACK VIEW (PURE TRACKING) ---
+# --- TASK 2: TRACK VIEW (SMART FILL - LOGIC MỚI) ---
 def track_youtube_views():
-    print("\n>>> TASK 2: Tracking Views (Source of Truth)...")
+    print("\n>>> TASK 2: Tracking Views (Auto-Fill Missing)...")
     
     try:
         videos = supabase.table('videos').select('*').eq('status', 'Active').execute().data
@@ -200,35 +194,68 @@ def track_youtube_views():
             url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id={ids}&key={YOUTUBE_API_KEY}"
             res = requests.get(url).json()
             
+            # Tạo map kết quả trả về từ API: { 'VIDEO_ID': data }
+            api_results = {item['id']: item for item in res.get('items', [])}
+            
             metrics_insert = []
             
-            for item in res.get('items', []):
-                yt_id = item['id']
-                stats = item['statistics']
-                snippet = item['snippet']
+            # DUYỆT QUA TỪNG VIDEO TRONG CHUNK (Video mình muốn track)
+            for db_vid in chunk:
+                yt_id = db_vid['yt_id']
                 
-                view_count = int(stats.get('viewCount', 0))
-                title = snippet.get('title', '')
-                published_at = snippet.get('publishedAt', '').split('T')[0]
+                # --- TRƯỜNG HỢP 1: API TRẢ VỀ DỮ LIỆU (Success) ---
+                if yt_id in api_results:
+                    item = api_results[yt_id]
+                    stats = item['statistics']
+                    snippet = item['snippet']
+                    
+                    view_count = int(stats.get('viewCount', 0))
+                    title = snippet.get('title', '')
+                    published_at = snippet.get('publishedAt', '').split('T')[0]
 
-                db_vid = next((v for v in chunk if v['yt_id'] == yt_id), None)
-                if db_vid:
-                    # 1. Lưu Metrics (History)
+                    # Thêm vào list insert
                     metrics_insert.append({
                         'video_id': db_vid['id'],
                         'view_count': view_count,
                         'recorded_at': today_str 
                     })
 
-                    # 2. Update Metadata cơ bản (Không tính CPM ở đây nữa)
+                    # Update Metadata bảng Videos
                     final_title = title if title else (db_vid.get('title') or db_vid.get('video_url'))
-
                     supabase.table('videos').update({
                         'title': final_title,
                         'released_date': published_at,
                         'current_views': view_count
                     }).eq('id', db_vid['id']).execute()
-            
+
+                # --- TRƯỜNG HỢP 2: API KHÔNG TRẢ VỀ (Video lỗi/Xóa/Không tìm thấy) ---
+                else:
+                    print(f"⚠️ Video {yt_id} mất tích -> Đang tìm view cũ để đắp vào...")
+                    try:
+                        # Query view gần nhất trong quá khứ của video này
+                        latest_metric = supabase.table('video_metrics')\
+                            .select('view_count')\
+                            .eq('video_id', db_vid['id'])\
+                            .order('recorded_at', desc=True)\
+                            .limit(1)\
+                            .execute()
+                        
+                        if latest_metric.data:
+                            last_view = latest_metric.data[0]['view_count']
+                            print(f"   -> Fill data ảo: {last_view} views")
+                            
+                            metrics_insert.append({
+                                'video_id': db_vid['id'],
+                                'view_count': last_view,
+                                'recorded_at': today_str # Vẫn ghi nhận là record của hôm nay
+                            })
+                            # Lưu ý: Không update bảng 'videos' (title/status) vì không có info mới
+                        else:
+                            print("   -> Chưa có lịch sử view nào, đành bỏ qua.")
+                    except Exception as e:
+                        print(f"   -> Lỗi khi tìm view cũ: {e}")
+
+            # Batch Upsert (Cả data thật và data fill)
             if metrics_insert:
                 supabase.table('video_metrics').upsert(metrics_insert, on_conflict='video_id,recorded_at').execute()
                 updated_count += len(metrics_insert)
@@ -236,7 +263,7 @@ def track_youtube_views():
         except Exception as e:
             print(f"❌ Lỗi batch Youtube API: {e}")
 
-    print(f"✅ Đã update view cho {updated_count} videos.")
+    print(f"✅ Đã update view cho {updated_count} videos (Bao gồm cả auto-fill).")
 
 # --- TASK 3: BUILD DASHBOARD (CALC ON THE FLY) ---
 def build_dashboard():
@@ -259,7 +286,6 @@ def build_dashboard():
     except: pass
 
     # 3. Build Rows
-    # Structure mới: [Title, KOL, Country, Released, Total View, View 7 Days, Growth, CPM, Agreement, Package, Content Count]
     headers = [
         'Video Title', 'KOL Name', 'Country', 'Released', 
         'Total Views', 'View (Last 7 Days)', 'Growth', 
@@ -271,17 +297,14 @@ def build_dashboard():
         video_url = item.get('video_url', '')
         video_id = item.get('id')
         
-        # Link & Title
         raw_title = item.get('title')
         display_title = raw_title if raw_title and str(raw_title).strip() != "" else video_url
         display_title = str(display_title).replace('"', '""') 
         title_cell = f'=HYPERLINK("{video_url}", "{display_title}")'
         
-        # Agreement
         agreement_link = item.get('agreement_link', '')
         agreement_cell = f'=HYPERLINK("{agreement_link}", "View Contract")' if agreement_link else "-"
 
-        # KOL Info
         kol_info = item.get('kols', {}) or {}
         kol_name = kol_info.get('name', 'Unknown')
         country = kol_info.get('country', '')
@@ -292,29 +315,17 @@ def build_dashboard():
         growth_value = current_views - old_views
         
         content_count = item.get('content_count', 0) or 0
-        
-        # TÍNH CPM: (Total Package * 1000) / (Content Count * Total View)
-        package_val = parse_currency(item.get('total_package', 0)) # Chuyển '$1,500' -> 1500.0
+        package_val = parse_currency(item.get('total_package', 0))
         
         cpm = 0.0
-        # Mẫu số: Content Count * Views
         denominator = content_count * current_views
-        
         if denominator > 0:
             cpm = (package_val * 1000) / denominator
         
         row = [
-            title_cell,
-            kol_name,
-            country,
-            item.get('released_date'),
-            current_views,  # E
-            old_views,      # F
-            growth_value,   # G
-            cpm,            # H (Current CPM - Calculated)
-            agreement_cell, # I
-            item.get('total_package'), # J (Display text gốc)
-            content_count   # K (Last Column)
+            title_cell, kol_name, country, item.get('released_date'),
+            current_views, old_views, growth_value, cpm,
+            agreement_cell, item.get('total_package'), content_count
         ]
         rows.append(row)
 
@@ -332,16 +343,9 @@ def build_dashboard():
 
         if rows:
             ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
-            
-            # Format Views: E, F, G
             ws.format(f'E2:G{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
-            
-            # Format CPM: H (2 số lẻ)
             ws.format(f'H2:H{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
-            
-            # Format Content Count: K
             ws.format(f'K2:K{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}})
-
             ws.set_basic_filter(f'A1:K{len(rows)+1}') 
             
         print("✅ Dashboard built successfully! (CPM calculated on-the-fly, No Status column)")
