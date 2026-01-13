@@ -189,6 +189,7 @@ def track_youtube_views():
     # --- PHẦN A: XỬ LÝ NON-YOUTUBE (AUTO FILL VIEW CŨ) ---
     non_yt_metrics = []
     for ov in other_videos:
+        # Lấy view cũ (ngày gần nhất) đắp vào ngày hôm nay
         last_known_view = ov.get('current_views', 0) or 0
         non_yt_metrics.append({
             'video_id': ov['id'],
@@ -336,24 +337,33 @@ def build_dashboard():
         kol_name = kol_info.get('name', 'Unknown')
         country = kol_info.get('country', '')
 
-        # --- DATA VIEW & CPM ---
+        # --- DATA VIEW ---
         current_views = item.get('current_views', 0)
         old_views = history_map.get(video_id, 0)
         growth = current_views - old_views
         
+        # --- DATA CPM INPUTS ---
+        # 1. Package: Xử lý kỹ chuỗi (loại bỏ ký tự lạ, dấu phẩy, chữ VND...) để lấy số
+        raw_package = str(item.get('total_package', '0'))
+        # Giữ lại số và dấu chấm (cho số thập phân)
+        clean_package_str = re.sub(r'[^\d.]', '', raw_package) 
         try:
-            total_package = float(str(item.get('total_package', 0)).replace(',', ''))
-        except: total_package = 0
+            total_package = float(clean_package_str) if clean_package_str else 0
+        except:
+            total_package = 0
         
+        # 2. Content Count
         try:
             content_count = int(item.get('content_count', 0))
         except: content_count = 1
         
-        # Logic tính CPM
+        # --- CPM CALCULATION (UPDATED LOGIC) ---
+        # Formula: (Package x 1000) / (Total Views x Content Count)
         cpm = 0
-        if current_views > 0:
-            avg_package_per_video = total_package / content_count if content_count > 0 else total_package
-            cpm = (avg_package_per_video / current_views) * 1000
+        denominator = current_views * content_count
+        
+        if denominator > 0:
+            cpm = (total_package * 1000) / denominator
 
         row = [
             title_cell, kol_name, country, item.get('released_date'),
