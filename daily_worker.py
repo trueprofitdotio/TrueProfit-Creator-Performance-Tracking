@@ -56,7 +56,7 @@ def extract_video_id(url):
     match = re.search(r'(?:v=|/|embed/|youtu\.be/)([\w-]{11})(?=&|\?|$)', url)
     return match.group(1) if match else None
 
-# --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE (FIXED: MAP ID STRATEGY) ---
+# --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE (MAP ID STRATEGY) ---
 def sync_progress_to_db():
     print("\n>>> TASK 1: Syncing Metadata (Progress -> DB)...")
     try:
@@ -67,21 +67,16 @@ def sync_progress_to_db():
         print(f"❌ Lỗi đọc sheet Progress: {e}")
         return
 
-    # [LOGIC MỚI] Map ID Youtube -> Link URL đang tồn tại trong DB
-    # Mục đích: Nếu video ID đã có (dù link dirty hay clean), ta bắt buộc dùng lại link đó để update
-    # Tránh việc DB có '...&t=1s', Sheet có 'clean', code lại insert thêm dòng 'clean' -> Duplicate.
-    
-    db_id_to_url_map = {} # Key: Youtube ID, Value: URL trong DB
-    existing_urls_set = set() # Dùng cho non-youtube check
+    # Map ID Youtube -> Link URL đang tồn tại trong DB
+    db_id_to_url_map = {} 
+    existing_urls_set = set() 
 
     try:
-        # Lấy tất cả video_url hiện có
         db_urls = supabase.table('videos').select('video_url').execute().data
         for item in db_urls:
             u = item['video_url']
             existing_urls_set.add(u)
             
-            # Nếu là youtube, extract ID và lưu vào map
             vid_id = extract_video_id(u)
             if vid_id:
                 db_id_to_url_map[vid_id] = u
@@ -97,7 +92,7 @@ def sync_progress_to_db():
         kol_name = str(row.get('Name', '')).strip()
         if not kol_name: continue 
         
-        # --- 1. XỬ LÝ KOL (Giữ nguyên) ---
+        # --- 1. XỬ LÝ KOL ---
         if kol_name not in kols_map:
             kol_data = {
                 'name': kol_name,
@@ -119,7 +114,7 @@ def sync_progress_to_db():
         kol_id = kols_map.get(kol_name)
         if not kol_id: continue
 
-        # --- 2. XỬ LÝ VIDEO (FIXED DUPLICATE LOGIC) ---
+        # --- 2. XỬ LÝ VIDEO ---
         raw_report_link_cell = str(row.get('Report Link', ''))
         found_links = re.findall(r'(https?://[^\s,]+)', raw_report_link_cell)
         
@@ -131,23 +126,17 @@ def sync_progress_to_db():
         except: content_count = 0
 
         for raw_link in found_links:
-            # Check xem có phải Youtube không
             vid_id = extract_video_id(raw_link)
-            
-            final_url_to_upsert = raw_link # Mặc định
+            final_url_to_upsert = raw_link 
 
             if vid_id:
-                # TRƯỜNG HỢP 1: LÀ YOUTUBE
+                # Youtube: Check duplicate ID
                 if vid_id in db_id_to_url_map:
-                    # CÓ: Video này (ID này) đã tồn tại trong DB -> Lấy cái URL cũ của nó ra dùng
-                    # (Bất kể URL cũ là dirty hay clean, dùng lại nó để update row đó)
                     final_url_to_upsert = db_id_to_url_map[vid_id]
                 else:
-                    # KHÔNG: Video mới tinh -> Tạo link Clean để insert chuẩn ngay từ đầu
                     final_url_to_upsert = f"https://www.youtube.com/watch?v={vid_id}"
             else:
-                # TRƯỜNG HỢP 2: KHÔNG PHẢI YOUTUBE -> GIỮ NGUYÊN
-                # (Logic cũ: dùng raw_link, upsert sẽ tự update nếu trùng url string)
+                # Non-Youtube
                 final_url_to_upsert = raw_link
 
             video_data = {
@@ -167,7 +156,7 @@ def sync_progress_to_db():
 
     print(f"✅ Đã đồng bộ metadata (xử lý {count_new} link video).")
 
-# --- TASK 2: TRACK VIEW (FAIL-SAFE MODE) ---
+# --- TASK 2: TRACK VIEW (FAIL-SAFE MODE - NO GROWTH COLUMN) ---
 def track_youtube_views():
     print("\n>>> TASK 2: Tracking Views (Fail-Safe Mode)...")
     
@@ -224,7 +213,7 @@ def track_youtube_views():
         ids_string = ",".join(ids_to_send)
         
         metrics_insert = []
-        returned_ids_set = set() # Set chứa ID Youtube trả về (để đối chiếu)
+        returned_ids_set = set() 
 
         # B.1: CỐ GẮNG GỌI API
         try:
@@ -236,7 +225,7 @@ def track_youtube_views():
             # Nếu API trả về data, xử lý bình thường
             for item in returned_items:
                 yt_id = item['id']
-                returned_ids_set.add(yt_id) # Mark as found
+                returned_ids_set.add(yt_id) 
                 
                 stats = item['statistics']
                 snippet = item['snippet']
@@ -250,46 +239,30 @@ def track_youtube_views():
                 db_vid = next((v for v in chunk if v['yt_id'] == yt_id), None)
                 
                 if db_vid:
-                    # Add vào list insert
+                    # Add vào list insert Metrics
                     metrics_insert.append({
                         'video_id': db_vid['id'],
                         'view_count': view_count,
                         'recorded_at': today_str 
                     })
 
-                    # Tính Growth
-                    date_7_ago = (now_vn - timedelta(days=7)).strftime('%Y-%m-%d')
-                    hist = supabase.table('video_metrics').select('view_count')\
-                        .eq('video_id', db_vid['id'])\
-                        .eq('recorded_at', date_7_ago)\
-                        .execute()
-                    
-                    view_7_days_ago = hist.data[0]['view_count'] if hist.data else view_count
-                    growth = view_count - view_7_days_ago
-
-                    # Update Metadata Videos
+                    # FIX: CHỈ UPDATE VIEW HIỆN TẠI, KHÔNG TÍNH GROWTH, KHÔNG GHI LAST_7_DAYS
                     final_title = title if title else (db_vid.get('title') or db_vid.get('video_url'))
                     supabase.table('videos').update({
                         'title': final_title,
                         'released_date': published_at,
-                        'current_views': view_count,
-                        'last_7_days_views': growth
+                        'current_views': view_count
+                        # Bỏ dòng 'last_7_days_views': growth -> Hết lỗi PGRST204
                     }).eq('id', db_vid['id']).execute()
 
         except Exception as e:
-            # QUAN TRỌNG: Nếu API lỗi (Quota, Mạng...), in lỗi nhưng KHÔNG ĐƯỢC DỪNG
-            # Code sẽ nhảy xuống B.2 với returned_ids_set là RỖNG -> Tất cả sẽ được Auto-fill
             print(f"⚠️ API Chunk Error (sẽ chuyển sang auto-fill): {e}")
 
         # B.2: ĐIỀN CHỖ TRỐNG (AUTO FILL MISSING / API ERROR)
-        # Logic: Những video nào nằm trong Chunk gửi đi, mà không nằm trong returned_ids_set (do API lỗi hoặc video bị ẩn)
-        # thì lấy view cũ đắp vào.
         for original_vid in chunk:
             if original_vid['yt_id'] not in returned_ids_set:
                 last_known_view = original_vid.get('current_views', 0) or 0
                 
-                # Chỉ log cảnh báo nếu không phải do lỗi API hàng loạt (để đỡ spam log)
-                # Nhưng ở đây cứ print để debug cho chắc
                 print(f"⚠️ Auto-fill view cũ cho {original_vid['yt_id']}: {last_known_view}")
                 
                 metrics_insert.append({
@@ -299,8 +272,7 @@ def track_youtube_views():
                 })
                 filled_count += 1
 
-        # B.3: BATCH UPSERT (QUAN TRỌNG: Nằm ngoài Try/Except của API)
-        # Đảm bảo dù API sống hay chết, metrics_insert luôn có dữ liệu (hoặc mới, hoặc cũ) để ghi vào DB
+        # B.3: BATCH UPSERT
         if metrics_insert:
             try:
                 supabase.table('video_metrics').upsert(metrics_insert, on_conflict='video_id,recorded_at').execute()
@@ -330,7 +302,7 @@ def build_dashboard():
         print(f"❌ Lỗi query Supabase Dashboard: {e}")
         return
 
-    # 2. Query Data History (View 7 ngày trước)
+    # 2. Query Data History (View 7 ngày trước) - QUERY TRỰC TIẾP TỪ VIDEO_METRICS
     try:
         date_7_ago = (get_hanoi_time() - timedelta(days=7)).strftime('%Y-%m-%d')
         metrics_res = supabase.table('video_metrics')\
