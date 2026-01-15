@@ -246,13 +246,12 @@ def track_youtube_views():
                         'recorded_at': today_str 
                     })
 
-                    # FIX: CHỈ UPDATE VIEW HIỆN TẠI, KHÔNG TÍNH GROWTH, KHÔNG GHI LAST_7_DAYS
+                    # UPDATE VIEW HIỆN TẠI VÀO DB
                     final_title = title if title else (db_vid.get('title') or db_vid.get('video_url'))
                     supabase.table('videos').update({
                         'title': final_title,
                         'released_date': published_at,
                         'current_views': view_count
-                        # Bỏ dòng 'last_7_days_views': growth -> Hết lỗi PGRST204
                     }).eq('id', db_vid['id']).execute()
 
         except Exception as e:
@@ -282,9 +281,9 @@ def track_youtube_views():
 
     print(f"✅ DONE: {updated_count} rows updated (Bao gồm cả Live và Filled).")
 
-# --- TASK 3: BUILD DASHBOARD (CPM FIX) ---
+# --- TASK 3: BUILD DASHBOARD (DATA ONLY - NO FORMAT OVERWRITE) ---
 def build_dashboard():
-    print("\n>>> TASK 3: Building KOL DASHBOARD (Raw Data & History)...")
+    print("\n>>> TASK 3: Building KOL DASHBOARD (Value Update Only)...")
     
     try:
         gc = get_gspread_client()
@@ -302,7 +301,7 @@ def build_dashboard():
         print(f"❌ Lỗi query Supabase Dashboard: {e}")
         return
 
-    # 2. Query Data History (View 7 ngày trước) - QUERY TRỰC TIẾP TỪ VIDEO_METRICS
+    # 2. Query Data History
     try:
         date_7_ago = (get_hanoi_time() - timedelta(days=7)).strftime('%Y-%m-%d')
         metrics_res = supabase.table('video_metrics')\
@@ -315,11 +314,12 @@ def build_dashboard():
         print(f"⚠️ Warning: Không lấy được history ({e}) -> Sẽ mặc định view cũ = 0")
         history_map = {}
 
-    headers = [
-        'Video Title', 'KOL Name', 'Country', 'Released', 
-        'Total Views', 'View 7 Days Ago', 'Growth (7 Days)', 'CPM ($)',
-        'Agreement', 'Package', 'Content Count'
-    ]
+    # Header không đổi, nhưng cứ khai báo để map data cho chuẩn
+    # headers = [
+    #     'Video Title', 'KOL Name', 'Country', 'Released', 
+    #     'Total Views', 'View 7 Days Ago', 'Growth (7 Days)', 'CPM ($)',
+    #     'Agreement', 'Package', 'Content Count'
+    # ]
     rows = []
     
     for item in data:
@@ -359,7 +359,6 @@ def build_dashboard():
         # --- CPM CALCULATION ---
         cpm = 0
         denominator = current_views * content_count
-        
         if denominator > 0:
             cpm = (total_package * 1000) / denominator
 
@@ -370,34 +369,29 @@ def build_dashboard():
         ]
         rows.append(row)
 
-    # 4. Ghi vào Sheet
+    # 4. Ghi vào Sheet (KHÔNG XÓA FORMAT)
     try:
         print("   - Đang ghi vào Google Sheet...")
         sh = gc.open_by_key(SPREADSHEET_ID)
         try:
             ws = sh.worksheet('KOL DASHBOARD')
-            ws.clear()
         except:
             print("   - Sheet 'KOL DASHBOARD' chưa có, đang tạo mới...")
             ws = sh.add_worksheet(title='KOL DASHBOARD', rows=1000, cols=20)
 
-        ws.update(range_name='A1', values=[headers])
-        ws.format('A1:K1', {'textFormat': {'bold': True}, 'horizontalAlignment': 'CENTER', 'backgroundColor': {'red': 0.8, 'green': 0.8, 'blue': 0.8}})
-
+        # FIX: CHỈ CẬP NHẬT VALUE, KHÔNG ĐỤNG FORMAT
         if rows:
-            ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
-            ws.format(f'E2:G{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
-            ws.format(f'H2:H{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
-            ws.format(f'K2:K{len(rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}})
+            # Xóa nội dung cũ từ dòng 2 trở đi (để tránh sót dữ liệu cũ nếu list mới ngắn hơn)
+            # Dùng batch_clear chỉ xóa value
+            ws.batch_clear(['A2:K'])
             
-            requests = [
-                {"addConditionalFormatRule": {"rule": {"ranges": [{"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": len(rows)+1, "startColumnIndex": 6, "endColumnIndex": 7}], "booleanRule": {"condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]}, "format": {"textFormat": {"foregroundColor": {"red": 0, "green": 0.6, "blue": 0}}}}}, "index": 0}},
-                {"addConditionalFormatRule": {"rule": {"ranges": [{"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": len(rows)+1, "startColumnIndex": 6, "endColumnIndex": 7}], "booleanRule": {"condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]}, "format": {"textFormat": {"foregroundColor": {"red": 1, "green": 0, "blue": 0}}}}}, "index": 1}}
-            ]
-            sh.batch_update({"requests": requests})
-            ws.set_basic_filter(f'A1:K{len(rows)+1}') 
+            # Ghi dữ liệu mới vào
+            ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
+            
+            # QUAN TRỌNG: Đã xóa hết các lệnh ws.format, addConditionalFormatRule...
+            # Google Sheet sẽ tự động áp dụng format của dòng/cột hiện tại cho dữ liệu mới paste vào.
 
-        print("✅ DONE! Vào Sheet check đi tml.")
+        print("✅ DONE! Data updated. Format preserved.")
     except Exception as e:
         print(f"❌ Chết đoạn ghi Sheet: {e}")
 
