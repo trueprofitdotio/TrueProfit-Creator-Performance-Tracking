@@ -29,6 +29,7 @@ jobs:
 
       - name: Run Daily Worker
         env:
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           TOKEN_JSON_BASE64: ${{ secrets.TOKEN_JSON_BASE64 }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
