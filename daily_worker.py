@@ -25,7 +25,10 @@ def get_hanoi_time():
 
 # --- AUTHENTICATION ---
 def get_gspread_client():
-    scopes = ['https://www.googleapis.com/auth/spreadsheets']
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
     gcp_secret = os.environ.get("GCP_SERVICE_ACCOUNT")
     
     if not gcp_secret:
