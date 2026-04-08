@@ -7,7 +7,7 @@ import base64
 import requests
 from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
-from google.oauth2.credentials import Credentials
+from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
 
 # --- CẤU HÌNH ---
@@ -25,25 +25,16 @@ def get_hanoi_time():
 
 # --- AUTHENTICATION ---
 def get_gspread_client():
-    SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+    scopes = ['https://www.googleapis.com/auth/spreadsheets']
+    gcp_secret = os.environ.get("GCP_SERVICE_ACCOUNT")
     
-    if os.environ.get("TOKEN_JSON_BASE64"):
-        try:
-            token_json_str = base64.b64decode(os.environ.get("TOKEN_JSON_BASE64")).decode('utf-8')
-            token_info = json.loads(token_json_str)
-            creds = Credentials.from_authorized_user_info(token_info, SCOPES)
-        except Exception as e:
-            raise Exception(f"❌ Lỗi decode token base64: {e}")
-            
-    elif os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    else:
-        raise Exception("❌ Không tìm thấy Token đăng nhập!")
-
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-
-    return gspread.authorize(creds)
+    if not gcp_secret:
+        raise ValueError("Lỗi: Thiếu GCP_SERVICE_ACCOUNT trong biến môi trường Github Secrets!")
+        
+    creds_dict = json.loads(gcp_secret)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    return client
 
 # Init Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
