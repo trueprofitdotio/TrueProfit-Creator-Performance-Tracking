@@ -65,6 +65,48 @@ def fetch_non_yt_data(url):
         print(f"   [!] yt-dlp không cào được {url} (Lỗi: {repr(e)})")
         return None, None
 
+def check_youtube_unlisted_status(video_id):
+    """
+    Kiểm tra trạng thái video Youtube (Unlisted/Private/Removed)
+    Dựa trên logic Cross-Reference Validation: videos.list + search.list
+    """
+    try:
+        # 1. Fetch Metadata: videos.list
+        v_url = f"https://www.googleapis.com/youtube/v3/videos?part=id&id={video_id}&key={YOUTUBE_API_KEY}"
+        v_res = requests.get(v_url).json()
+        if not v_res.get('items'):
+            return "Private/Removed" # Không tìm thấy trong videos.list -> Private hoặc bị xóa
+
+        # 2. Search Validation: search.list (chỉ video Public mới hiện ở đây)
+        s_url = f"https://www.googleapis.com/youtube/v3/search?part=id&q={video_id}&type=video&key={YOUTUBE_API_KEY}"
+        s_res = requests.get(s_url).json()
+        
+        # Kiểm tra xem ID có khớp chính xác trong kết quả search không
+        items = s_res.get('items', [])
+        found_in_search = any(item.get('id', {}).get('videoId') == video_id for item in items)
+        
+        if found_in_search:
+            return "Public"
+        else:
+            return "Unlisted"
+    except Exception as e:
+        print(f"   [!] Lỗi khi check Youtube status cho {video_id}: {repr(e)}")
+        return "Unknown"
+
+def check_non_yt_accessibility(url):
+    """Sử dụng yt-dlp --simulate để kiểm tra video TikTok/IG còn tồn tại không"""
+    ydl_opts = {
+        'quiet': True,
+        'simulate': True,
+        'force_generic_extractor': False,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=False)
+            return True # Vẫn truy cập được
+    except Exception:
+        return False # Lỗi -> Possibly Unlisted/Deleted
+
 # --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
 def sync_progress_to_db():
     print("\n>>> TASK 1: Syncing Metadata (Progress -> DB)...")
@@ -300,6 +342,72 @@ def track_youtube_views():
 
     print(f"✅ DONE: {updated_count} records cập nhật (Gồm Live Cào và Fail-safe).")
 
+# --- TASK 2.5: UPDATE VIDEO STATUSES (Stalled, Possibly Unlisted) ---
+def update_video_statuses():
+    print("\n>>> TASK 2.5: Detecting Stalled/Unlisted Videos...")
+    try:
+        # Lấy tất cả videos
+        videos = supabase.table('videos').select('*').execute().data
+        
+        # Lấy view 7 ngày trước để tính growth
+        date_7_ago = (get_hanoi_time() - timedelta(days=7)).strftime('%Y-%m-%d')
+        metrics_res = supabase.table('video_metrics').select('video_id, view_count').eq('recorded_at', date_7_ago).execute()
+        history_map = {item['video_id']: item['view_count'] for item in metrics_res.data}
+        
+        print(f"   - Đã load view cũ cho {len(history_map)} videos.")
+    except Exception as e:
+        print(f"❌ Lỗi truy vấn data status: {repr(e)}")
+        return
+
+    updates_count = 0
+    for v in videos:
+        vid_id = v['id']
+        url = v['video_url']
+        current_views = v.get('current_views', 0) or 0
+        old_views = history_map.get(vid_id, 0)
+        
+        # Tính % growth (7 ngày)
+        if old_views > 0:
+            growth_pct = ((current_views - old_views) / old_views) * 100
+        else:
+            growth_pct = 100 if current_views > 0 else 0
+            
+        new_status = "Healthy"
+        
+        # Logic detect status:
+        if growth_pct > 1:
+            new_status = "Healthy"
+        else:
+            # Nếu growth <= 1% -> "Stalled" hoặc "Possibly Unlisted"
+            print(f"   🔎 Checking stalled video {vid_id} (% growth: {growth_pct:.2f}%)...")
+            
+            yt_id = extract_video_id(url)
+            if yt_id:
+                # Logic Youtube
+                yt_status = check_youtube_unlisted_status(yt_id)
+                if yt_status == "Public":
+                    new_status = "Stalled"
+                elif yt_status in ["Unlisted", "Private/Removed"]:
+                    new_status = "Possibly Unlisted"
+                else:
+                    new_status = "Stalled" # Fallback
+            else:
+                # TikTok / Instagram
+                if check_non_yt_accessibility(url):
+                    new_status = "Stalled"
+                else:
+                    new_status = "Possibly Unlisted"
+        
+        # Update if changed
+        if new_status != v.get('status'):
+            try:
+                supabase.table('videos').update({'status': new_status}).eq('id', vid_id).execute()
+                updates_count += 1
+            except Exception as e:
+                print(f"⚠️ Lỗi cập nhật status {vid_id}: {repr(e)}")
+
+    print(f"✅ Đã cập nhật trạng thái cho {updates_count} videos.")
+
 # --- TASK 3: BUILD DASHBOARD ---
 def build_dashboard():
     print("\n>>> TASK 3: Building KOL DASHBOARD (Value Update Only)...")
@@ -396,6 +504,7 @@ if __name__ == "__main__":
     try:
         sync_progress_to_db()
         track_youtube_views()
+        update_video_statuses() # Cập nhật Healthy/Stalled/Unlisted
         build_dashboard()
         print("\n🚀 ALL TASKS COMPLETED!")
     except Exception as e:
