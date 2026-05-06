@@ -65,11 +65,39 @@ def fetch_non_yt_data(url):
         print(f"   [!] yt-dlp không cào được {url} (Lỗi: {repr(e)})")
         return None, None
 
+def check_youtube_status_via_api(video_id):
+    """
+    Kiểm tra trạng thái video Youtube (Public/Unlisted/Private) qua API v3.
+    Cực kỳ ổn định trên GitHub Actions vì không bị bot detection.
+    """
+    try:
+        # 1. Kiểm tra xem video có tồn tại không (Public hoặc Unlisted)
+        v_url = f"https://www.googleapis.com/youtube/v3/videos?part=id&id={video_id}&key={YOUTUBE_API_KEY}"
+        v_res = requests.get(v_url).json()
+        if not v_res.get('items'):
+            return "Unlisted/Private" # Không thấy id -> Private hoặc bị xóa
+
+        # 2. Kiểm tra xem có hiện ở kết quả tìm kiếm không (Chỉ video Public mới hiện)
+        s_url = f"https://www.googleapis.com/youtube/v3/search?part=id&q={video_id}&type=video&key={YOUTUBE_API_KEY}"
+        s_res = requests.get(s_url).json()
+        
+        items = s_res.get('items', [])
+        is_public = any(item.get('id', {}).get('videoId') == video_id for item in items)
+        
+        return "Public" if is_public else "Unlisted/Private"
+    except Exception as e:
+        print(f"   [!] Youtube API check failed for {video_id}: {repr(e)}")
+        return "Public" # Fallback an toàn
+
 def check_video_availability(url):
     """
-    Sử dụng yt-dlp để kiểm tra trạng thái video (Public/Unlisted/Private)
-    Dùng extract_info để lấy metadata và verify field 'availability'.
+    Hybrid logic: Dùng API cho Youtube và yt-dlp cho các nền tảng khác.
     """
+    yt_id = extract_video_id(url)
+    if yt_id:
+        return check_youtube_status_via_api(yt_id)
+        
+    # Non-Youtube: Dùng yt-dlp (Best effort)
     ydl_opts = {
         'quiet': True,
         'skip_download': True,
@@ -78,26 +106,18 @@ def check_video_availability(url):
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # extract_info sẽ raise exception nếu video bị xóa hoặc private hoàn toàn
-            info = ydl.extract_info(url, download=False)
-            
-            # Lấy availability field (phổ biến trên YouTube)
-            # Nếu không có (TikTok/IG), mà extract thành công thì coi như Public
-            availability = info.get('availability', 'public')
-            
-            if not availability:
-                return "Public"
-                
-            availability = str(availability).lower()
-            if availability == 'public':
-                return "Public"
-            elif availability in ['unlisted', 'private', 'limited', 'needs_auth']:
-                return "Unlisted/Private"
-            else:
-                return "Public"
+            # Nếu extract_info thành công -> Video còn sống (Public)
+            ydl.extract_info(url, download=False)
+            return "Public"
     except Exception as e:
-        # Nếu lỗi (404, private, block) -> Coi như không còn Public
-        print(f"   [!] yt-dlp check failed (Unavailable): {url}")
+        err_msg = str(e).lower()
+        # Fallback logic: Nếu lỗi do bot detection/sign-in -> Coi như vẫn Public (Stalled)
+        # để tránh đánh dấu nhầm video "Possibly Unlisted"
+        if "sign in" in err_msg or "bot" in err_msg or "403" in err_msg:
+            print(f"   [!] yt-dlp blocked by bot detection for {url}. Defaulting to Public.")
+            return "Public"
+        
+        print(f"   [!] yt-dlp confirmed unavailable/deleted for {url}")
         return "Unlisted/Private"
 
 # --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
