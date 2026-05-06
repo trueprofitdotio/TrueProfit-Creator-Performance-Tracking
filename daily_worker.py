@@ -65,60 +65,47 @@ def fetch_non_yt_data(url):
         print(f"   [!] yt-dlp không cào được {url} (Lỗi: {repr(e)})")
         return None, None
 
-def check_youtube_status_via_api(video_id):
+def check_youtube_unlisted_status(video_id):
     """
-    Kiểm tra trạng thái video Youtube (Public/Unlisted/Private) qua API v3.
-    Cực kỳ ổn định trên GitHub Actions vì không bị bot detection.
+    Kiểm tra trạng thái video Youtube (Unlisted/Private/Removed)
+    Dựa trên logic Cross-Reference Validation: videos.list + search.list
     """
     try:
-        # 1. Kiểm tra xem video có tồn tại không (Public hoặc Unlisted)
+        # 1. Fetch Metadata: videos.list
         v_url = f"https://www.googleapis.com/youtube/v3/videos?part=id&id={video_id}&key={YOUTUBE_API_KEY}"
         v_res = requests.get(v_url).json()
         if not v_res.get('items'):
-            return "Unlisted/Private" # Không thấy id -> Private hoặc bị xóa
+            return "Private/Removed" # Không tìm thấy trong videos.list -> Private hoặc bị xóa
 
-        # 2. Kiểm tra xem có hiện ở kết quả tìm kiếm không (Chỉ video Public mới hiện)
+        # 2. Search Validation: search.list (chỉ video Public mới hiện ở đây)
         s_url = f"https://www.googleapis.com/youtube/v3/search?part=id&q={video_id}&type=video&key={YOUTUBE_API_KEY}"
         s_res = requests.get(s_url).json()
         
+        # Kiểm tra xem ID có khớp chính xác trong kết quả search không
         items = s_res.get('items', [])
-        is_public = any(item.get('id', {}).get('videoId') == video_id for item in items)
+        found_in_search = any(item.get('id', {}).get('videoId') == video_id for item in items)
         
-        return "Public" if is_public else "Unlisted/Private"
+        if found_in_search:
+            return "Public"
+        else:
+            return "Unlisted"
     except Exception as e:
-        print(f"   [!] Youtube API check failed for {video_id}: {repr(e)}")
-        return "Public" # Fallback an toàn
+        print(f"   [!] Lỗi khi check Youtube status cho {video_id}: {repr(e)}")
+        return "Unknown"
 
-def check_video_availability(url):
-    """
-    Hybrid logic: Dùng API cho Youtube và yt-dlp cho các nền tảng khác.
-    """
-    yt_id = extract_video_id(url)
-    if yt_id:
-        return check_youtube_status_via_api(yt_id)
-        
-    # Non-Youtube: Dùng yt-dlp (Best effort)
+def check_non_yt_accessibility(url):
+    """Sử dụng yt-dlp --simulate để kiểm tra video TikTok/IG còn tồn tại không"""
     ydl_opts = {
         'quiet': True,
-        'skip_download': True,
-        'no_warnings': True,
-        'socket_timeout': 10,
+        'simulate': True,
+        'force_generic_extractor': False,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Nếu extract_info thành công -> Video còn sống (Public)
             ydl.extract_info(url, download=False)
-            return "Public"
-    except Exception as e:
-        err_msg = str(e).lower()
-        # Fallback logic: Nếu lỗi do bot detection/sign-in -> Coi như vẫn Public (Stalled)
-        # để tránh đánh dấu nhầm video "Possibly Unlisted"
-        if "sign in" in err_msg or "bot" in err_msg or "403" in err_msg:
-            print(f"   [!] yt-dlp blocked by bot detection for {url}. Defaulting to Public.")
-            return "Public"
-        
-        print(f"   [!] yt-dlp confirmed unavailable/deleted for {url}")
-        return "Unlisted/Private"
+            return True # Vẫn truy cập được
+    except Exception:
+        return False # Lỗi -> Possibly Unlisted/Deleted
 
 # --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
 def sync_progress_to_db():
@@ -388,19 +375,28 @@ def update_video_statuses():
         new_status = "Healthy"
         
         # Logic detect status:
-        if growth_pct > 2:
+        if growth_pct > 1:
             new_status = "Healthy"
         else:
-            # Nếu growth <= 2% -> satisfy stalled condition -> Trigger unlisted check
-            print(f"   🔎 Video {vid_id} is stalled (Growth: {growth_pct:.2f}%). Checking unlisted status...")
+            # Nếu growth <= 1% -> "Stalled" hoặc "Possibly Unlisted"
+            print(f"   🔎 Checking stalled video {vid_id} (% growth: {growth_pct:.2f}%)...")
             
-            # Chỉ check unlisted nếu đã bị stall
-            availability_status = check_video_availability(url)
-            
-            if availability_status == "Public":
-                new_status = "Stalled"
+            yt_id = extract_video_id(url)
+            if yt_id:
+                # Logic Youtube
+                yt_status = check_youtube_unlisted_status(yt_id)
+                if yt_status == "Public":
+                    new_status = "Stalled"
+                elif yt_status in ["Unlisted", "Private/Removed"]:
+                    new_status = "Possibly Unlisted"
+                else:
+                    new_status = "Stalled" # Fallback
             else:
-                new_status = "Possibly Unlisted"
+                # TikTok / Instagram
+                if check_non_yt_accessibility(url):
+                    new_status = "Stalled"
+                else:
+                    new_status = "Possibly Unlisted"
         
         # Update if changed
         if new_status != v.get('status'):
