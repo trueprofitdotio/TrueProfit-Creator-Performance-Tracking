@@ -80,7 +80,7 @@ def fetch_non_yt_data(url):
         'skip_download': True,
         'extract_flat': False,
         'no_warnings': True,
-        'socket_timeout': 15, # Set timeout 15s để GHA ko bị treo nếu bị block
+        'socket_timeout': 15,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -93,12 +93,6 @@ def fetch_non_yt_data(url):
 def check_youtube_video_status(video_id: str) -> str:
     """
     Dùng YouTube Data API v3 (videos.list) để kiểm tra privacy status của video.
-    Tự động rotate API key nếu bị quota (HTTP 403).
-
-    Trả về:
-        "Healthy"           - privacyStatus = public
-        "Unlisted/Removed"  - privacyStatus != public hoặc items[] rỗng
-        "Unknown"           - Lỗi API, không thể xác định
     """
     tried_keys = 0
     while tried_keys < len(YOUTUBE_API_KEYS):
@@ -113,44 +107,31 @@ def check_youtube_video_status(video_id: str) -> str:
             res = requests.get(url, timeout=15)
 
             if res.status_code == 403:
-                err_body = res.json().get('error', {}).get('message', '')
-                print(f"   ⚠️ Quota hit (key #{_yt_key_index % len(YOUTUBE_API_KEYS) + 1}): {err_body[:80]}")
                 rotate_yt_api_key()
                 tried_keys += 1
-                continue  # Thử key mới
+                continue
 
             if res.status_code != 200:
-                print(f"   [!] YouTube API Error {res.status_code} cho {video_id}")
                 return "Unknown"
 
             data = res.json()
             items = data.get('items', [])
 
             if not items:
-                # Không có kết quả = video bị xóa / unavailable
                 return "Unlisted/Removed"
 
             privacy = items[0].get('status', {}).get('privacyStatus', '').lower()
-
-            if privacy == 'public':
-                return "Healthy"
-            else:
-                return "Unlisted/Removed"
+            return "Healthy" if privacy == 'public' else "Unlisted/Removed"
 
         except Exception as e:
-            print(f"   [!] Exception khi check YouTube status cho {video_id}: {repr(e)}")
             return "Unknown"
 
-    print(f"   ❌ Tất cả YouTube API key đều bị quota! Không thể check {video_id}.")
     return "Unknown"
 
 
 def check_non_yt_status(url: str) -> str:
     """
     Kiểm tra video TikTok/IG/Twitter bằng yt-dlp.
-    Nếu cào được viewcount hợp lệ -> "Healthy"
-    Nếu bị block/rate-limit -> "Blocked" (giữ nguyên status cũ)
-    Nếu thực sự không truy cập được -> "Unlisted/Removed"
     """
     ydl_opts = {
         'quiet': True,
@@ -166,26 +147,12 @@ def check_non_yt_status(url: str) -> str:
             if view_count is not None and isinstance(view_count, int):
                 return "Healthy"
             else:
-                # Mở được nhưng không có viewcount hợp lệ -> Unlisted/Removed
                 return "Unlisted/Removed"
     except Exception as e:
         err_str = str(e).lower()
-        # Lỗi do bị chặn / hạn chế tốc độ / yt-dlp không parse được -> không phải bị xóa
-        BLOCKED_KEYWORDS = [
-            "block",
-            "429",
-            "rate limit",
-            "login required",
-            "impersonation",
-            "no video could be found",
-            "csrf token",
-            "requested content is not available",
-            "cookies",
-        ]
+        BLOCKED_KEYWORDS = ["block", "429", "rate limit", "login required", "cookies"]
         if any(kw in err_str for kw in BLOCKED_KEYWORDS):
-            print(f"   [~] Blocked/Rate-limited (không đánh giá được): {url}")
             return "Blocked"
-        print(f"   [!] Inaccessible: {url} ({err_str[:100]})")
         return "Unlisted/Removed"
 
 
@@ -211,19 +178,15 @@ def sync_progress_to_db():
             u = item['video_url']
             db_id_to_url_map[extract_video_id(u) or u] = u
             existing_status_map[u] = item.get('status')
-                
         print(f"ℹ️ Đã load {len(db_res)} videos từ DB.")
     except Exception as e:
         print(f"⚠️ Không load được danh sách URL cũ: {repr(e)}")
 
-    count_new = 0
     kols_map = {} 
-
-    for row_idx, row in enumerate(records):
+    for row in records:
         kol_name = str(row.get('Name', '')).strip()
         if not kol_name: continue 
         
-        # --- 1. XỬ LÝ KOL ---
         if kol_name not in kols_map:
             kol_data = {
                 'name': kol_name,
@@ -233,19 +196,15 @@ def sync_progress_to_db():
             }
             try:
                 res = supabase.table('kols').upsert(kol_data, on_conflict='name').execute()
-                if res.data:
-                    kols_map[kol_name] = res.data[0]['id']
+                if res.data: kols_map[kol_name] = res.data[0]['id']
                 else:
                     data = supabase.table('kols').select('id').eq('name', kol_name).execute().data
                     if data: kols_map[kol_name] = data[0]['id']
-            except Exception as e:
-                print(f"⚠️ Lỗi xử lý KOL {kol_name}: {repr(e)}")
-                continue
+            except: continue
         
         kol_id = kols_map.get(kol_name)
         if not kol_id: continue
 
-        # --- 2. XỬ LÝ VIDEO ---
         raw_report_link_cell = str(row.get('Report Link', ''))
         found_links = re.findall(r'(https?://[^\s,]+)', raw_report_link_cell)
         
@@ -258,52 +217,36 @@ def sync_progress_to_db():
 
         for raw_link in found_links:
             vid_id = extract_video_id(raw_link)
-            final_url_to_upsert = raw_link 
-
-            if vid_id:
-                if vid_id in db_id_to_url_map:
-                    final_url_to_upsert = db_id_to_url_map[vid_id]
-                else:
-                    final_url_to_upsert = f"https://www.youtube.com/watch?v={vid_id}"
-            else:
-                final_url_to_upsert = raw_link
+            final_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else raw_link
 
             video_data = {
                 'kol_id': kol_id,
-                'video_url': final_url_to_upsert, 
+                'video_url': final_url, 
                 'agreement_link': agreement,
                 'total_package': package,
                 'content_count': content_count
             }
-            
-            # Chỉ set status là Active nếu là video hoàn toàn mới
-            if final_url_to_upsert not in existing_status_map:
+            if final_url not in existing_status_map:
                 video_data['status'] = 'Active'
 
             try:
                 supabase.table('videos').upsert(video_data, on_conflict='video_url').execute()
-                count_new += 1
-            except Exception as e:
-                print(f"⚠️ Lỗi insert video {final_url_to_upsert}: {repr(e)}")
+            except: pass
 
-    print(f"✅ Đã đồng bộ metadata (xử lý {count_new} link video).")
+    print("✅ Đã đồng bộ metadata.")
+
 
 # --- TASK 2: TRACK VIEW ---
 def track_youtube_views():
     print("\n>>> TASK 2: Tracking Views...")
-    
     try:
-        # Track tất cả video trừ những cái đã xác nhận bị xóa/private hẳn
-        videos = supabase.table('videos').select('*')\
-            .neq('status', 'Unlisted/Removed')\
-            .execute().data
+        videos = supabase.table('videos').select('*').neq('status', 'Unlisted/Removed').execute().data
     except Exception as e:
-        print(f"❌ Lỗi đọc Supabase: {repr(e)}")
+        print(f"❌ Lỗi Supabase: {repr(e)}")
         return
     
     youtube_videos = []
     other_videos = [] 
-
     for v in videos:
         vid = extract_video_id(v['video_url'])
         if vid:
@@ -312,275 +255,156 @@ def track_youtube_views():
         else:
             other_videos.append(v)
     
-    print(f"🔍 Total Scan: {len(videos)} videos ({len(youtube_videos)} Youtube | {len(other_videos)} Others)")
-
     now_vn = get_hanoi_time()
     today_str = now_vn.strftime('%Y-%m-%d') 
-    
     updated_count = 0
 
-    # --- PHẦN A: XỬ LÝ NON-YOUTUBE BẰNG YT-DLP ---
+    # Non-YouTube
     non_yt_metrics = []
-    if other_videos:
-        print(f"⚡ Đang cào view cho {len(other_videos)} video Non-Youtube (TikTok, IG, ...)")
-        
     for ov in other_videos:
-        url = ov['video_url']
-        last_known_view = ov.get('current_views', 0) or 0
-        
-        scraped_view, scraped_title = fetch_non_yt_data(url)
-        
-        # Logic fail-safe: Cào tịt thì xài view cũ
-        final_view = scraped_view if scraped_view is not None else last_known_view
+        scraped_view, scraped_title = fetch_non_yt_data(ov['video_url'])
+        final_view = scraped_view if scraped_view is not None else (ov.get('current_views', 0) or 0)
         
         if scraped_view is not None:
-            # Update DB (videos table)
-            final_title = scraped_title if scraped_title else (ov.get('title') or url)
             try:
-                supabase.table('videos').update({
-                    'title': final_title,
-                    'current_views': final_view
-                }).eq('id', ov['id']).execute()
-            except Exception as e:
-                pass
-        else:
-            print(f"   ⚠️ Fail-safe: Tự động fill view cũ cho {url} -> {final_view} views")
-
-        non_yt_metrics.append({
-            'video_id': ov['id'],
-            'view_count': final_view,
-            'recorded_at': today_str 
-        })
+                supabase.table('videos').update({'title': scraped_title or ov.get('video_url'), 'current_views': final_view}).eq('id', ov['id']).execute()
+            except: pass
+        
+        non_yt_metrics.append({'video_id': ov['id'], 'view_count': final_view, 'recorded_at': today_str})
     
     if non_yt_metrics:
         try:
             supabase.table('video_metrics').upsert(non_yt_metrics, on_conflict='video_id,recorded_at').execute()
             updated_count += len(non_yt_metrics)
-        except Exception as e:
-            print(f"❌ Lỗi Insert Non-Youtube Metrics: {repr(e)}")
+        except: pass
 
-    # --- PHẦN B: XỬ LÝ YOUTUBE BẰNG API V3 ---
+    # YouTube
     if youtube_videos:
-        print(f"⚡ Đang quét view API cho {len(youtube_videos)} video Youtube...")
-        
-    chunk_size = 50
-    for i in range(0, len(youtube_videos), chunk_size):
-        chunk = youtube_videos[i:i+chunk_size]
-        ids_to_send = [v['yt_id'] for v in chunk]
-        ids_string = ",".join(ids_to_send)
-        
-        metrics_insert = []
-        returned_ids_set = set() 
+        chunk_size = 50
+        for i in range(0, len(youtube_videos), chunk_size):
+            chunk = youtube_videos[i:i+chunk_size]
+            ids_string = ",".join([v['yt_id'] for v in chunk])
+            metrics_insert = []
+            returned_ids = set()
 
-        try:
-            url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id={ids_string}&key={YOUTUBE_API_KEY}"
-            res = requests.get(url).json()
-            returned_items = res.get('items', [])
+            tried_keys = 0
+            res_json = None
+            while tried_keys < len(YOUTUBE_API_KEYS):
+                api_key = get_yt_api_key()
+                try:
+                    url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id={ids_string}&key={api_key}"
+                    resp = requests.get(url, timeout=15)
+                    if resp.status_code == 403:
+                        rotate_yt_api_key()
+                        tried_keys += 1
+                        continue
+                    if resp.status_code == 200:
+                        res_json = resp.json()
+                        break
+                    else: break
+                except: break
+
+            if res_json:
+                for item in res_json.get('items', []):
+                    yt_id = item['id']
+                    returned_ids.add(yt_id)
+                    view_count = int(item['statistics'].get('viewCount', 0))
+                    title = item['snippet'].get('title', '')
+                    pub_date = item['snippet'].get('publishedAt', '').split('T')[0]
+                    
+                    db_v = next(v for v in chunk if v['yt_id'] == yt_id)
+                    metrics_insert.append({'video_id': db_v['id'], 'view_count': view_count, 'recorded_at': today_str})
+                    try:
+                        supabase.table('videos').update({'title': title, 'released_date': pub_date, 'current_views': view_count}).eq('id', db_v['id']).execute()
+                    except: pass
             
-            for item in returned_items:
-                yt_id = item['id']
-                returned_ids_set.add(yt_id) 
-                stats = item['statistics']
-                snippet = item['snippet']
-                
-                try: view_count = int(stats.get('viewCount', 0))
-                except: view_count = 0
-                
-                title = snippet.get('title', '')
-                published_at = snippet.get('publishedAt', '').split('T')[0]
+            for v in chunk:
+                if v['yt_id'] not in returned_ids:
+                    view = v.get('current_views', 0) or 0
+                    metrics_insert.append({'video_id': v['id'], 'view_count': view, 'recorded_at': today_str})
+                    failsafe_video_ids.add(v['id'])
+            
+            if metrics_insert:
+                try:
+                    supabase.table('video_metrics').upsert(metrics_insert, on_conflict='video_id,recorded_at').execute()
+                    updated_count += len(metrics_insert)
+                except: pass
 
-                db_vid = next((v for v in chunk if v['yt_id'] == yt_id), None)
-                
-                if db_vid:
-                    metrics_insert.append({
-                        'video_id': db_vid['id'],
-                        'view_count': view_count,
-                        'recorded_at': today_str 
-                    })
-                    final_title = title if title else (db_vid.get('title') or db_vid.get('video_url'))
-                    supabase.table('videos').update({
-                        'title': final_title,
-                        'released_date': published_at,
-                        'current_views': view_count
-                    }).eq('id', db_vid['id']).execute()
+    print(f"✅ Đã cập nhật {updated_count} records.")
 
-        except Exception as e:
-            print(f"⚠️ API Chunk Error: {repr(e)}")
-
-        # Fail-safe Youtube
-        for original_vid in chunk:
-            if original_vid['yt_id'] not in returned_ids_set:
-                last_known_view = original_vid.get('current_views', 0) or 0
-                print(f"   ⚠️ Fail-safe Youtube: Tự động fill view cũ cho {original_vid['yt_id']} -> {last_known_view} views")
-                metrics_insert.append({
-                    'video_id': original_vid['id'],
-                    'view_count': last_known_view,
-                    'recorded_at': today_str 
-                })
-                # Đánh dấu video này là fail-safe để TASK 2.5 bỏ qua check unlisted
-                # (API không trả về không có nghĩa là bị xóa - có thể do quota/network)
-                failsafe_video_ids.add(original_vid['id'])
-
-        if metrics_insert:
-            try:
-                supabase.table('video_metrics').upsert(metrics_insert, on_conflict='video_id,recorded_at').execute()
-                updated_count += len(metrics_insert)
-            except Exception as e:
-                print(f"❌ Lỗi CRITICAL khi Upsert Youtube Metrics: {repr(e)}")
-
-    print(f"✅ DONE: {updated_count} records cập nhật (Gồm Live Cào và Fail-safe).")
 
 # --- TASK 2.5: UPDATE VIDEO STATUSES ---
 def update_video_statuses():
-    """
-    Kiểm tra từng video và cập nhật trạng thái:
-    - YouTube: public -> Healthy, còn lại -> Unlisted/Removed
-    - Non-YouTube: có viewcount -> Healthy, không có -> Unlisted/Removed
-    """
-    print("\n>>> TASK 2.5: Updating Video Statuses (Privacy Check)...")
+    print("\n>>> TASK 2.5: Updating Video Statuses...")
     try:
         videos = supabase.table('videos').select('id, video_url, status').execute().data
-        print(f"   - Kiểm tra {len(videos)} videos...")
-    except Exception as e:
-        print(f"❌ Lỗi truy vấn data: {repr(e)}")
-        return
-
-    updates_count = 0
-    skipped_failsafe = 0
+    except: return
 
     for v in videos:
-        vid_id  = v['id']
-        url     = v['video_url']
-        current = v.get('status', 'Active')
-
+        vid_id, url, current = v['id'], v['video_url'], v.get('status', 'Active')
         yt_id = extract_video_id(url)
 
         if yt_id:
-            # --- YouTube ---
-            if vid_id in failsafe_video_ids:
-                print(f"   ⏭️ Skipping failsafe YT video: {yt_id}")
-                skipped_failsafe += 1
-                continue
-
+            if vid_id in failsafe_video_ids: continue
             new_status = check_youtube_video_status(yt_id)
-            if new_status == "Unknown":
-                continue
         else:
-            # --- Non-YouTube (TikTok / IG / Twitter) ---
             new_status = check_non_yt_status(url)
-            if new_status == "Blocked":
-                skipped_failsafe += 1
-                continue
+            if new_status == "Blocked": continue
 
-        # Update status (ghi đè giá trị cũ)
-        if new_status != current:
+        if new_status != "Unknown" and new_status != current:
             try:
                 supabase.table('videos').update({'status': new_status}).eq('id', vid_id).execute()
-                updates_count += 1
-                print(f"   ✏️ {url[:60]}: {current} -> {new_status}")
-            except Exception as e:
-                print(f"   ⚠️ Lỗi cập nhật status {vid_id}: {repr(e)}")
-
-    print(f"✅ Kiểm tra xong. Cập nhật: {updates_count} | Bỏ qua (failsafe/blocked): {skipped_failsafe}")
+                print(f"   ✏️ {url[:50]}: {current} -> {new_status}")
+            except: pass
 
 
 # --- TASK 3: BUILD DASHBOARD ---
 def build_dashboard():
-    print("\n>>> TASK 3: Building KOL DASHBOARD (Value Update Only)...")
-    
+    print("\n>>> TASK 3: Building KOL DASHBOARD...")
     try:
         gc = get_gspread_client()
-    except Exception as e:
-        print(f"❌ Lỗi Auth Google Sheet: {repr(e)}")
-        return
-
-    try:
-        print("   - Đang lấy data từ Supabase...")
-        res = supabase.table('videos').select('*, kols(name, country, subscriber_count)').order('released_date', desc=True).execute()
-        data = res.data
-        print(f"   - Tìm thấy {len(data)} videos.")
-    except Exception as e:
-        print(f"❌ Lỗi query Supabase Dashboard: {repr(e)}")
-        return
-
-    try:
+        data = supabase.table('videos').select('*, kols(name, country, subscriber_count)').order('released_date', desc=True).execute().data
         date_7_ago = (get_hanoi_time() - timedelta(days=7)).strftime('%Y-%m-%d')
-        metrics_res = supabase.table('video_metrics')\
-            .select('video_id, view_count')\
-            .eq('recorded_at', date_7_ago)\
-            .execute()
-        
-        history_map = {item['video_id']: item['view_count'] for item in metrics_res.data}
-    except Exception as e:
-        history_map = {}
+        hist_res = supabase.table('video_metrics').select('video_id, view_count').eq('recorded_at', date_7_ago).execute().data
+        history_map = {item['video_id']: item['view_count'] for item in hist_res}
+    except: return
 
     rows = []
-    
     for item in data:
-        raw_title = item.get('title')
         video_url = item.get('video_url', '')
-        video_id = item.get('id')
+        title = str(item.get('title') or video_url).replace('"', '""')
+        title_cell = f'=HYPERLINK("{video_url}", "{title}")'
+        kol = item.get('kols', {}) or {}
         
-        display_title = raw_title if raw_title and str(raw_title).strip() != "" else video_url
-        display_title = str(display_title).replace('"', '""')
+        current_v = item.get('current_views', 0)
+        old_v = history_map.get(item['id'], 0)
+        growth = current_v - old_v
+        
+        package_str = re.sub(r'[^\d.]', '', str(item.get('total_package', '0')))
+        pkg = float(package_str) if package_str else 0
+        count = int(item.get('content_count', 1) or 1)
+        cpm = (pkg * 1000) / (current_v * count) if (current_v * count) > 0 else 0
 
-        title_cell = f'=HYPERLINK("{video_url}", "{display_title}")'
-        
-        agreement_link = item.get('agreement_link', '')
-        agreement_cell = f'=HYPERLINK("{agreement_link}", "View Contract")' if agreement_link else "-"
-
-        kol_info = item.get('kols', {}) or {}
-        kol_name = kol_info.get('name', 'Unknown')
-        country = kol_info.get('country', '')
-
-        current_views = item.get('current_views', 0)
-        old_views = history_map.get(video_id, 0)
-        growth = current_views - old_views
-        
-        raw_package = str(item.get('total_package', '0'))
-        clean_package_str = re.sub(r'[^\d.]', '', raw_package) 
-        try:
-            total_package = float(clean_package_str) if clean_package_str else 0
-        except:
-            total_package = 0
-        
-        try:
-            content_count = int(item.get('content_count', 0))
-        except: content_count = 1
-        
-        cpm = 0
-        denominator = current_views * content_count
-        if denominator > 0:
-            cpm = (total_package * 1000) / denominator
-
-        row = [
-            title_cell, kol_name, country, item.get('released_date'),
-            current_views, old_views, growth, cpm,
-            agreement_cell, item.get('total_package'), content_count
-        ]
-        rows.append(row)
+        rows.append([
+            title_cell, kol.get('name', 'Unknown'), kol.get('country', ''), item.get('released_date'),
+            current_v, old_v, growth, cpm,
+            f'=HYPERLINK("{item.get("agreement_link","")}", "View Contract")' if item.get("agreement_link") else "-",
+            item.get('total_package'), count
+        ])
 
     try:
-        print("   - Đang ghi vào Google Sheet...")
-        sh = gc.open_by_key(SPREADSHEET_ID)
-        try:
-            ws = sh.worksheet('KOL DASHBOARD')
-        except:
-            ws = sh.add_worksheet(title='KOL DASHBOARD', rows=1000, cols=20)
+        ws = gc.open_by_key(SPREADSHEET_ID).worksheet('KOL DASHBOARD')
+        ws.batch_clear(['A2:K'])
+        ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
+        print("✅ Dashboard updated.")
+    except: pass
 
-        if rows:
-            ws.batch_clear(['A2:K'])
-            ws.update(range_name='A2', values=rows, value_input_option='USER_ENTERED')
-
-        print("✅ DONE! Data updated. Format preserved.")
-    except Exception as e:
-        print(f"❌ Chết đoạn ghi Sheet: {repr(e)}")
 
 if __name__ == "__main__":
     try:
         sync_progress_to_db()
         track_youtube_views()
-        update_video_statuses() # Cập nhật Healthy/Stalled/Unlisted
+        update_video_statuses()
         build_dashboard()
         print("\n🚀 ALL TASKS COMPLETED!")
     except Exception as e:
