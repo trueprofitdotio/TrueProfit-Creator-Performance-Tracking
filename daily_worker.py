@@ -96,11 +96,9 @@ def check_youtube_video_status(video_id: str) -> str:
     Tự động rotate API key nếu bị quota (HTTP 403).
 
     Trả về:
-        "Healthy"          - privacyStatus = public
-        "Unlisted"         - privacyStatus = unlisted  
-        "Private"          - privacyStatus = private
-        "Removed"          - items[] rỗng (bị xóa/không còn tồn tại)
-        "Unknown"          - Lỗi API, không thể xác định
+        "Healthy"           - privacyStatus = public
+        "Unlisted/Removed"  - privacyStatus != public hoặc items[] rỗng
+        "Unknown"           - Lỗi API, không thể xác định
     """
     tried_keys = 0
     while tried_keys < len(YOUTUBE_API_KEYS):
@@ -130,20 +128,14 @@ def check_youtube_video_status(video_id: str) -> str:
 
             if not items:
                 # Không có kết quả = video bị xóa / unavailable
-                return "Removed"
+                return "Unlisted/Removed"
 
             privacy = items[0].get('status', {}).get('privacyStatus', '').lower()
 
             if privacy == 'public':
                 return "Healthy"
-            elif privacy == 'unlisted':
-                return "Unlisted"
-            elif privacy == 'private':
-                return "Private"
             else:
-                # privacyStatus trả về giá trị lạ
-                print(f"   [?] privacyStatus không xác định: '{privacy}' cho {video_id}")
-                return "Unknown"
+                return "Unlisted/Removed"
 
         except Exception as e:
             print(f"   [!] Exception khi check YouTube status cho {video_id}: {repr(e)}")
@@ -158,7 +150,7 @@ def check_non_yt_status(url: str) -> str:
     Kiểm tra video TikTok/IG/Twitter bằng yt-dlp.
     Nếu cào được viewcount hợp lệ -> "Healthy"
     Nếu bị block/rate-limit -> "Blocked" (giữ nguyên status cũ)
-    Nếu thực sự không truy cập được -> "Possibly Unlisted"
+    Nếu thực sự không truy cập được -> "Unlisted/Removed"
     """
     ydl_opts = {
         'quiet': True,
@@ -174,8 +166,8 @@ def check_non_yt_status(url: str) -> str:
             if view_count is not None and isinstance(view_count, int):
                 return "Healthy"
             else:
-                # Mở được nhưng không có viewcount hợp lệ -> possibly unlisted
-                return "Possibly Unlisted"
+                # Mở được nhưng không có viewcount hợp lệ -> Unlisted/Removed
+                return "Unlisted/Removed"
     except Exception as e:
         err_str = str(e).lower()
         # Lỗi do bị chặn / hạn chế tốc độ / yt-dlp không parse được -> không phải bị xóa
@@ -194,7 +186,7 @@ def check_non_yt_status(url: str) -> str:
             print(f"   [~] Blocked/Rate-limited (không đánh giá được): {url}")
             return "Blocked"
         print(f"   [!] Inaccessible: {url} ({err_str[:100]})")
-        return "Possibly Unlisted"
+        return "Unlisted/Removed"
 
 
 # --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
@@ -303,7 +295,7 @@ def track_youtube_views():
     try:
         # Track tất cả video trừ những cái đã xác nhận bị xóa/private hẳn
         videos = supabase.table('videos').select('*')\
-            .not_.in_('status', ['Removed', 'Private'])\
+            .neq('status', 'Unlisted/Removed')\
             .execute().data
     except Exception as e:
         print(f"❌ Lỗi đọc Supabase: {repr(e)}")
@@ -441,16 +433,9 @@ def track_youtube_views():
 # --- TASK 2.5: UPDATE VIDEO STATUSES ---
 def update_video_statuses():
     """
-    Kiểm tra từng video và cập nhật trạng thái dựa trên privacy status thực tế:
-    - YouTube: Gọi videos.list API để lấy privacyStatus thực tế
-        -> public   : Healthy
-        -> unlisted : Unlisted  
-        -> private  : Private
-        -> removed  : Removed
-    - Non-YouTube (TikTok/IG/Twitter): Dùng yt-dlp, kiểm tra có viewcount hợp lệ không
-        -> Có viewcount : Healthy
-        -> Blocked/Auth : Giữ nguyên status cũ (không đánh giá được)
-        -> Không có    : Possibly Unlisted
+    Kiểm tra từng video và cập nhật trạng thái:
+    - YouTube: public -> Healthy, còn lại -> Unlisted/Removed
+    - Non-YouTube: có viewcount -> Healthy, không có -> Unlisted/Removed
     """
     print("\n>>> TASK 2.5: Updating Video Statuses (Privacy Check)...")
     try:
@@ -473,28 +458,21 @@ def update_video_statuses():
         if yt_id:
             # --- YouTube ---
             if vid_id in failsafe_video_ids:
-                # API không trả về video này khi track views (quota/network)
-                # -> Không thể kết luận, giữ nguyên status cũ
-                print(f"   ⏭️ Skipping failsafe YT video (không chắc chắn): {yt_id}")
+                print(f"   ⏭️ Skipping failsafe YT video: {yt_id}")
                 skipped_failsafe += 1
                 continue
 
             new_status = check_youtube_video_status(yt_id)
-
             if new_status == "Unknown":
-                # Lỗi API -> Giữ nguyên, đừng mark sai
                 continue
-
         else:
             # --- Non-YouTube (TikTok / IG / Twitter) ---
             new_status = check_non_yt_status(url)
-
             if new_status == "Blocked":
-                # Bị chặn/rate-limit -> Giữ nguyên status cũ
                 skipped_failsafe += 1
                 continue
 
-        # Chỉ ghi DB khi status thực sự thay đổi
+        # Update status (ghi đè giá trị cũ)
         if new_status != current:
             try:
                 supabase.table('videos').update({'status': new_status}).eq('id', vid_id).execute()
