@@ -119,21 +119,18 @@ def sync_progress_to_db():
         print(f"❌ Lỗi đọc sheet Progress: {repr(e)}")
         return
 
-    # Map ID Youtube -> Link URL đang tồn tại trong DB
+    # Map ID Youtube -> Link URL đang tồn tại trong DB, kèm status để bảo toàn
     db_id_to_url_map = {} 
-    existing_urls_set = set() 
+    existing_status_map = {} # video_url -> status
 
     try:
-        db_urls = supabase.table('videos').select('video_url').execute().data
-        for item in db_urls:
+        db_res = supabase.table('videos').select('video_url, status').execute().data
+        for item in db_res:
             u = item['video_url']
-            existing_urls_set.add(u)
-            
-            vid_id = extract_video_id(u)
-            if vid_id:
-                db_id_to_url_map[vid_id] = u
+            db_id_to_url_map[extract_video_id(u) or u] = u
+            existing_status_map[u] = item.get('status')
                 
-        print(f"ℹ️ Đã load {len(db_urls)} videos từ DB. Mapping được {len(db_id_to_url_map)} Youtube IDs.")
+        print(f"ℹ️ Đã load {len(db_res)} videos từ DB.")
     except Exception as e:
         print(f"⚠️ Không load được danh sách URL cũ: {repr(e)}")
 
@@ -194,10 +191,13 @@ def sync_progress_to_db():
                 'video_url': final_url_to_upsert, 
                 'agreement_link': agreement,
                 'total_package': package,
-                'content_count': content_count,
-                'status': 'Active'
+                'content_count': content_count
             }
             
+            # Chỉ set status là Active nếu là video hoàn toàn mới
+            if final_url_to_upsert not in existing_status_map:
+                video_data['status'] = 'Active'
+
             try:
                 supabase.table('videos').upsert(video_data, on_conflict='video_url').execute()
                 count_new += 1
@@ -211,7 +211,8 @@ def track_youtube_views():
     print("\n>>> TASK 2: Tracking Views...")
     
     try:
-        videos = supabase.table('videos').select('*').eq('status', 'Active').execute().data
+        # Lấy tất cả video để track view, ngoại trừ những cái đã bị xóa/private hẳn
+        videos = supabase.table('videos').select('*').neq('status', 'Private/Removed').execute().data
     except Exception as e:
         print(f"❌ Lỗi đọc Supabase: {repr(e)}")
         return
