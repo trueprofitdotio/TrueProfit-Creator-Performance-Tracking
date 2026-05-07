@@ -73,16 +73,26 @@ def check_youtube_unlisted_status(video_id):
     try:
         # 1. Fetch Metadata: videos.list
         v_url = f"https://www.googleapis.com/youtube/v3/videos?part=id&id={video_id}&key={YOUTUBE_API_KEY}"
-        v_res = requests.get(v_url).json()
-        if not v_res.get('items'):
+        v_res = requests.get(v_url)
+        if v_res.status_code != 200:
+            print(f"   [!] YouTube API Error (videos): {v_res.status_code}")
+            return "Unknown"
+            
+        v_data = v_res.json()
+        if not v_data.get('items'):
             return "Private/Removed" # Không tìm thấy trong videos.list -> Private hoặc bị xóa
 
         # 2. Search Validation: search.list (chỉ video Public mới hiện ở đây)
         s_url = f"https://www.googleapis.com/youtube/v3/search?part=id&q={video_id}&type=video&key={YOUTUBE_API_KEY}"
-        s_res = requests.get(s_url).json()
+        s_res = requests.get(s_url)
+        if s_res.status_code != 200:
+            print(f"   [!] YouTube API Error (search): {s_res.status_code}")
+            return "Unknown"
+            
+        s_data = s_res.json()
         
         # Kiểm tra xem ID có khớp chính xác trong kết quả search không
-        items = s_res.get('items', [])
+        items = s_data.get('items', [])
         found_in_search = any(item.get('id', {}).get('videoId') == video_id for item in items)
         
         if found_in_search:
@@ -94,18 +104,27 @@ def check_youtube_unlisted_status(video_id):
         return "Unknown"
 
 def check_non_yt_accessibility(url):
-    """Sử dụng yt-dlp --simulate để kiểm tra video TikTok/IG còn tồn tại không"""
+    """
+    Kiểm tra video TikTok/IG còn tồn tại không.
+    Trả về: "Accessible", "Blocked", "Inaccessible"
+    """
     ydl_opts = {
         'quiet': True,
         'simulate': True,
         'force_generic_extractor': False,
+        'socket_timeout': 10,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.extract_info(url, download=False)
-            return True # Vẫn truy cập được
-    except Exception:
-        return False # Lỗi -> Possibly Unlisted/Deleted
+            return "Accessible"
+    except Exception as e:
+        err_str = str(e).lower()
+        # Nếu bị block IP hoặc rate limit -> Trả về Blocked để tránh mark lầm unlisted
+        if any(keyword in err_str for keyword in ["block", "429", "rate limit", "login required", "impersonation"]):
+            return "Blocked"
+        # Nếu lỗi là "video not found" hoặc tương tự -> Inaccessible
+        return "Inaccessible"
 
 # --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
 def sync_progress_to_db():
@@ -391,13 +410,17 @@ def update_video_statuses():
                 elif yt_status in ["Unlisted", "Private/Removed"]:
                     new_status = "Possibly Unlisted"
                 else:
-                    new_status = "Stalled" # Fallback
+                    new_status = v.get('status', 'Stalled') # Giữ nguyên status cũ hoặc fallback Stalled nếu bị lỗi API
             else:
                 # TikTok / Instagram
-                if check_non_yt_accessibility(url):
+                access = check_non_yt_accessibility(url)
+                if access == "Accessible":
                     new_status = "Stalled"
-                else:
+                elif access == "Inaccessible":
                     new_status = "Possibly Unlisted"
+                else:
+                    # Nếu bị Blocked -> Giữ nguyên status cũ (Healthy/Stalled), đừng mark Unlisted
+                    new_status = v.get('status', 'Stalled')
         
         # Update if changed
         if new_status != v.get('status'):
