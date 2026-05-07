@@ -210,7 +210,6 @@ def sync_progress_to_db():
 def track_youtube_views():
     print("\n>>> TASK 2: Tracking Views...")
     
-    live_views_map = {} # Để sync trực tiếp qua Task 2.5
     try:
         videos = supabase.table('videos').select('*').eq('status', 'Active').execute().data
     except Exception as e:
@@ -262,9 +261,6 @@ def track_youtube_views():
         else:
             print(f"   ⚠️ Fail-safe: Tự động fill view cũ cho {url} -> {final_view} views")
 
-        # Sync map
-        live_views_map[ov['id']] = final_view
-
         non_yt_metrics.append({
             'video_id': ov['id'],
             'view_count': final_view,
@@ -311,7 +307,6 @@ def track_youtube_views():
                 db_vid = next((v for v in chunk if v['yt_id'] == yt_id), None)
                 
                 if db_vid:
-                    live_views_map[db_vid['id']] = view_count
                     metrics_insert.append({
                         'video_id': db_vid['id'],
                         'view_count': view_count,
@@ -332,7 +327,6 @@ def track_youtube_views():
             if original_vid['yt_id'] not in returned_ids_set:
                 last_known_view = original_vid.get('current_views', 0) or 0
                 print(f"   ⚠️ Fail-safe Youtube: Tự động fill view cũ cho {original_vid['yt_id']} -> {last_known_view} views")
-                live_views_map[original_vid['id']] = last_known_view
                 metrics_insert.append({
                     'video_id': original_vid['id'],
                     'view_count': last_known_view,
@@ -347,10 +341,9 @@ def track_youtube_views():
                 print(f"❌ Lỗi CRITICAL khi Upsert Youtube Metrics: {repr(e)}")
 
     print(f"✅ DONE: {updated_count} records cập nhật (Gồm Live Cào và Fail-safe).")
-    return live_views_map
 
 # --- TASK 2.5: UPDATE VIDEO STATUSES (Stalled, Possibly Unlisted) ---
-def update_video_statuses(live_views_map=None):
+def update_video_statuses():
     print("\n>>> TASK 2.5: Detecting Stalled/Unlisted Videos...")
     try:
         # Lấy tất cả videos
@@ -370,12 +363,7 @@ def update_video_statuses(live_views_map=None):
     for v in videos:
         vid_id = v['id']
         url = v['video_url']
-        
-        # Ưu tiên dùng live view vừa cào được để tránh lag DB
         current_views = v.get('current_views', 0) or 0
-        if live_views_map and vid_id in live_views_map:
-            current_views = live_views_map[vid_id]
-            
         old_views = history_map.get(vid_id, 0)
         
         # Tính % growth (7 ngày)
@@ -387,7 +375,7 @@ def update_video_statuses(live_views_map=None):
         new_status = "Healthy"
         
         # Logic detect status:
-        if growth_pct > 2: # Threshold 2% theo yêu cầu mới nhất
+        if growth_pct > 1:
             new_status = "Healthy"
         else:
             # Nếu growth <= 1% -> "Stalled" hoặc "Possibly Unlisted"
@@ -515,8 +503,8 @@ def build_dashboard():
 if __name__ == "__main__":
     try:
         sync_progress_to_db()
-        live_views = track_youtube_views()
-        update_video_statuses(live_views) # Cập nhật Healthy/Stalled/Unlisted với data tươi
+        track_youtube_views()
+        update_video_statuses() # Cập nhật Healthy/Stalled/Unlisted
         build_dashboard()
         print("\n🚀 ALL TASKS COMPLETED!")
     except Exception as e:
