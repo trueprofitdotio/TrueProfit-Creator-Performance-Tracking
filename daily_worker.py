@@ -41,6 +41,10 @@ def get_gspread_client():
 # Init Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Set lưu video_id của những video bị fail-safe (API không trả về)
+# TASK 2.5 sẽ bỏ qua việc check unlisted cho những video này
+failsafe_video_ids: set = set()
+
 # --- HELPER ---
 def extract_video_id(url):
     """Trích xuất Video ID từ link Youtube"""
@@ -105,7 +109,7 @@ def check_youtube_unlisted_status(video_id):
 
 def check_non_yt_accessibility(url):
     """
-    Kiểm tra video TikTok/IG còn tồn tại không.
+    Kiểm tra video TikTok/IG/Twitter còn tồn tại không.
     Trả về: "Accessible", "Blocked", "Inaccessible"
     """
     ydl_opts = {
@@ -120,10 +124,23 @@ def check_non_yt_accessibility(url):
             return "Accessible"
     except Exception as e:
         err_str = str(e).lower()
-        # Nếu bị block IP hoặc rate limit -> Trả về Blocked để tránh mark lầm unlisted
-        if any(keyword in err_str for keyword in ["block", "429", "rate limit", "login required", "impersonation"]):
+        # Danh sách lỗi = bị chặn/giới hạn tốc độ/yt-dlp không hỗ trợ, KHÔNG phải video bị xóa
+        BLOCKED_KEYWORDS = [
+            "block",                    # TikTok IP block
+            "429",                      # Rate limit HTTP code
+            "rate limit",               # Rate limit text
+            "login required",           # Instagram/IG auth
+            "impersonation",            # TikTok impersonation warning
+            "no video could be found",  # Twitter/X - tweet tồn tại nhưng yt-dlp ko parse được
+            "csrf token",               # Instagram API token error
+            "requested content is not available",  # Instagram rate limit
+            "cookies",                  # Auth required
+        ]
+        if any(keyword in err_str for keyword in BLOCKED_KEYWORDS):
+            print(f"   [~] Blocked/Rate-limited (not unlisted): {url}")
             return "Blocked"
-        # Nếu lỗi là "video not found" hoặc tương tự -> Inaccessible
+        # Chỉ trả về Inaccessible nếu lỗi rõ ràng là video bị xóa/riêng tư
+        print(f"   [!] Potentially inaccessible: {url} ({err_str[:100]})")
         return "Inaccessible"
 
 # --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
@@ -352,6 +369,9 @@ def track_youtube_views():
                     'view_count': last_known_view,
                     'recorded_at': today_str 
                 })
+                # Đánh dấu video này là fail-safe để TASK 2.5 bỏ qua check unlisted
+                # (API không trả về không có nghĩa là bị xóa - có thể do quota/network)
+                failsafe_video_ids.add(original_vid['id'])
 
         if metrics_insert:
             try:
@@ -392,41 +412,50 @@ def update_video_statuses():
         else:
             growth_pct = 100 if current_views > 0 else 0
             
-        new_status = "Healthy"
+        new_status = v.get('status', 'Active') # Mặc định giữ nguyên status hiện tại
         
         # Logic detect status:
         if growth_pct > 1:
+            # Growth tốt -> Healthy
             new_status = "Healthy"
+        elif vid_id in failsafe_video_ids:
+            # Video bị fail-safe trong TASK 2 (API quota/network error)
+            # Không thể kết luận gì, giữ nguyên status cũ
+            print(f"   ⏭️ Skipping failsafe video {vid_id} (API không trả về khi track views)")
+            continue
         else:
-            # Nếu growth <= 1% -> "Stalled" hoặc "Possibly Unlisted"
+            # Growth <= 1% -> kiểm tra xem có bị unlisted không
             print(f"   🔎 Checking stalled video {vid_id} (% growth: {growth_pct:.2f}%)...")
             
             yt_id = extract_video_id(url)
             if yt_id:
-                # Logic Youtube
+                # Logic Youtube: Dùng YouTube Data API v3 để verify
                 yt_status = check_youtube_unlisted_status(yt_id)
                 if yt_status == "Public":
                     new_status = "Stalled"
                 elif yt_status in ["Unlisted", "Private/Removed"]:
                     new_status = "Possibly Unlisted"
                 else:
-                    new_status = v.get('status', 'Stalled') # Giữ nguyên status cũ hoặc fallback Stalled nếu bị lỗi API
+                    # "Unknown" = lỗi API -> Giữ nguyên status cũ, đừng mark sai
+                    new_status = v.get('status', 'Stalled')
             else:
-                # TikTok / Instagram
+                # TikTok / Instagram / Twitter
                 access = check_non_yt_accessibility(url)
                 if access == "Accessible":
                     new_status = "Stalled"
                 elif access == "Inaccessible":
+                    # Chỉ mark Possibly Unlisted nếu thực sự inaccessible
                     new_status = "Possibly Unlisted"
                 else:
-                    # Nếu bị Blocked -> Giữ nguyên status cũ (Healthy/Stalled), đừng mark Unlisted
+                    # "Blocked" = bị block IP/rate limit -> Giữ nguyên, đừng mark sai
                     new_status = v.get('status', 'Stalled')
         
-        # Update if changed
+        # Chỉ update nếu status thực sự thay đổi
         if new_status != v.get('status'):
             try:
                 supabase.table('videos').update({'status': new_status}).eq('id', vid_id).execute()
                 updates_count += 1
+                print(f"   ✏️ Updated {vid_id}: {v.get('status')} -> {new_status}")
             except Exception as e:
                 print(f"⚠️ Lỗi cập nhật status {vid_id}: {repr(e)}")
 
