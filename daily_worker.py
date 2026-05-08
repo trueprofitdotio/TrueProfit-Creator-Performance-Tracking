@@ -73,6 +73,64 @@ def extract_video_id(url):
     match = re.search(r'(?:v=|/|embed/|youtu\.be/)([\w-]{11})(?=&|\?|$)', url)
     return match.group(1) if match else None
 
+def extract_canonical_id(url):
+    """
+    Trích xuất canonical platform-native ID từ URL.
+    Format trả về: yt_<id>, tt_<id>, x_<id>, ig_<id>
+    """
+    if not isinstance(url, str): return None
+    
+    # YouTube
+    yt_id = extract_video_id(url)
+    if yt_id: return f"yt_{yt_id}"
+    
+    # TikTok
+    tt_match = re.search(r'tiktok\.com/.*video/(\d+)', url)
+    if tt_match: return f"tt_{tt_match.group(1)}"
+    
+    # X/Twitter
+    x_match = re.search(r'(?:twitter\.com|x\.com)/.*/status/(\d+)', url)
+    if x_match: return f"x_{x_match.group(1)}"
+    
+    # Instagram
+    ig_match = re.search(r'instagram\.com/(?:reels?|p|reel)/([^/?#&]+)', url)
+    if ig_match: return f"ig_{ig_match.group(1)}"
+    
+    return None
+
+def upsert_metrics_with_comparison(metrics_list):
+    """
+    Upsert metrics vào Supabase, giữ lại view_count lớn nhất nếu xảy ra xung đột (cùng video, cùng ngày).
+    """
+    if not metrics_list: return
+    
+    today_str = get_hanoi_time().strftime('%Y-%m-%d')
+    
+    try:
+        # Lấy danh sách video_id để kiểm tra record hiện có trong ngày
+        vids = [m['video_id'] for m in metrics_list]
+        res = supabase.table('video_metrics').select('video_id, view_count').eq('recorded_at', today_str).in_('video_id', vids).execute()
+        existing_map = {m['video_id']: m['view_count'] for m in res.data}
+    except:
+        existing_map = {}
+
+    to_upsert = []
+    for m in metrics_list:
+        vid_id = m['video_id']
+        new_views = m['view_count']
+        if vid_id in existing_map:
+            # Chỉ cập nhật nếu số view mới lớn hơn số view đã lưu
+            if new_views > existing_map[vid_id]:
+                to_upsert.append(m)
+        else:
+            to_upsert.append(m)
+            
+    if to_upsert:
+        try:
+            supabase.table('video_metrics').upsert(to_upsert, on_conflict='video_id,recorded_at').execute()
+        except Exception as e:
+            print(f"   [!] Lỗi upsert video_metrics: {repr(e)}")
+
 def fetch_non_yt_data(url):
     """Dùng yt-dlp cào data các nền tảng khác (TikTok, IG,...)"""
     ydl_opts = {
@@ -168,19 +226,16 @@ def sync_progress_to_db():
         print(f"❌ Lỗi đọc sheet Progress: {repr(e)}")
         return
 
-    # Map ID Youtube -> Link URL đang tồn tại trong DB, kèm status để bảo toàn
-    db_id_to_url_map = {} 
-    existing_status_map = {} # video_url -> status
-
+    # Load existing videos by new_id to check status
+    existing_videos = {} # new_id -> status
     try:
-        db_res = supabase.table('videos').select('video_url, status').execute().data
+        db_res = supabase.table('videos').select('new_id, status').execute().data
         for item in db_res:
-            u = item['video_url']
-            db_id_to_url_map[extract_video_id(u) or u] = u
-            existing_status_map[u] = item.get('status')
+            if item.get('new_id'):
+                existing_videos[item['new_id']] = item.get('status')
         print(f"ℹ️ Đã load {len(db_res)} videos từ DB.")
     except Exception as e:
-        print(f"⚠️ Không load được danh sách URL cũ: {repr(e)}")
+        print(f"⚠️ Không load được danh sách video cũ: {repr(e)}")
 
     kols_map = {} 
     for row in records:
@@ -216,22 +271,30 @@ def sync_progress_to_db():
         except: content_count = 0
 
         for raw_link in found_links:
-            vid_id = extract_video_id(raw_link)
-            final_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else raw_link
+            new_id = extract_canonical_id(raw_link)
+            if not new_id: continue
+
+            # Chuẩn hóa URL cho Youtube
+            yt_id = extract_video_id(raw_link)
+            final_url = f"https://www.youtube.com/watch?v={yt_id}" if yt_id else raw_link
 
             video_data = {
+                'new_id': new_id,
                 'kol_id': kol_id,
                 'video_url': final_url, 
                 'agreement_link': agreement,
                 'total_package': package,
                 'content_count': content_count
             }
-            if final_url not in existing_status_map:
+            # Chỉ set status mặc định là Active nếu chưa tồn tại
+            if new_id not in existing_videos:
                 video_data['status'] = 'Active'
 
             try:
-                supabase.table('videos').upsert(video_data, on_conflict='video_url').execute()
-            except: pass
+                # Upsert dựa trên new_id thay vì video_url
+                supabase.table('videos').upsert(video_data, on_conflict='new_id').execute()
+            except Exception as e:
+                print(f"   [!] Lỗi upsert video {new_id}: {repr(e)}")
 
     print("✅ Đã đồng bộ metadata.")
 
@@ -240,6 +303,7 @@ def sync_progress_to_db():
 def track_youtube_views():
     print("\n>>> TASK 2: Tracking Views...")
     try:
+        # Lấy danh sách video đang hoạt động
         videos = supabase.table('videos').select('*').neq('status', 'Unlisted/Removed').execute().data
     except Exception as e:
         print(f"❌ Lỗi Supabase: {repr(e)}")
@@ -248,9 +312,10 @@ def track_youtube_views():
     youtube_videos = []
     other_videos = [] 
     for v in videos:
-        vid = extract_video_id(v['video_url'])
-        if vid:
-            v['yt_id'] = vid
+        # Dùng extract_video_id để phân loại Youtube vs nền tảng khác
+        yt_id = extract_video_id(v['video_url'])
+        if yt_id:
+            v['yt_id'] = yt_id
             youtube_videos.append(v)
         else:
             other_videos.append(v)
@@ -259,26 +324,28 @@ def track_youtube_views():
     today_str = now_vn.strftime('%Y-%m-%d') 
     updated_count = 0
 
-    # Non-YouTube
+    # Xử lý Non-YouTube
     non_yt_metrics = []
     for ov in other_videos:
         scraped_view, scraped_title = fetch_non_yt_data(ov['video_url'])
+        # Dự phòng nếu lỗi scrap: lấy views hiện tại
         final_view = scraped_view if scraped_view is not None else (ov.get('current_views', 0) or 0)
         
         if scraped_view is not None:
             try:
-                supabase.table('videos').update({'title': scraped_title or ov.get('video_url'), 'current_views': final_view}).eq('id', ov['id']).execute()
+                supabase.table('videos').update({
+                    'title': scraped_title or ov.get('video_url'), 
+                    'current_views': final_view
+                }).eq('id', ov['id']).execute()
             except: pass
         
         non_yt_metrics.append({'video_id': ov['id'], 'view_count': final_view, 'recorded_at': today_str})
     
     if non_yt_metrics:
-        try:
-            supabase.table('video_metrics').upsert(non_yt_metrics, on_conflict='video_id,recorded_at').execute()
-            updated_count += len(non_yt_metrics)
-        except: pass
+        upsert_metrics_with_comparison(non_yt_metrics)
+        updated_count += len(non_yt_metrics)
 
-    # YouTube
+    # Xử lý YouTube
     if youtube_videos:
         chunk_size = 50
         for i in range(0, len(youtube_videos), chunk_size):
@@ -315,9 +382,14 @@ def track_youtube_views():
                     db_v = next(v for v in chunk if v['yt_id'] == yt_id)
                     metrics_insert.append({'video_id': db_v['id'], 'view_count': view_count, 'recorded_at': today_str})
                     try:
-                        supabase.table('videos').update({'title': title, 'released_date': pub_date, 'current_views': view_count}).eq('id', db_v['id']).execute()
+                        supabase.table('videos').update({
+                            'title': title, 
+                            'released_date': pub_date, 
+                            'current_views': view_count
+                        }).eq('id', db_v['id']).execute()
                     except: pass
             
+            # Xử lý fail-safe cho các video không trả về kết quả từ API (bị xóa/unlisted)
             for v in chunk:
                 if v['yt_id'] not in returned_ids:
                     view = v.get('current_views', 0) or 0
@@ -325,10 +397,8 @@ def track_youtube_views():
                     failsafe_video_ids.add(v['id'])
             
             if metrics_insert:
-                try:
-                    supabase.table('video_metrics').upsert(metrics_insert, on_conflict='video_id,recorded_at').execute()
-                    updated_count += len(metrics_insert)
-                except: pass
+                upsert_metrics_with_comparison(metrics_insert)
+                updated_count += len(metrics_insert)
 
     print(f"✅ Đã cập nhật {updated_count} records.")
 
