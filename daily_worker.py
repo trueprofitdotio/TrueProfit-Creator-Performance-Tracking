@@ -440,6 +440,21 @@ def build_dashboard():
     except: return
 
     rows = []
+    # Deduplicate by new_id to prevent any potential UI/logic duplicates in the sheet
+    seen_ids = set()
+    deduped_data = []
+    for item in data:
+        nid = item.get('new_id')
+        if nid:
+            if nid not in seen_ids:
+                seen_ids.add(nid)
+                deduped_data.append(item)
+        else:
+            # If for some reason new_id is missing, use ID as fallback for safety
+            deduped_data.append(item)
+    
+    data = deduped_data
+
     for item in data:
         video_url = item.get('video_url', '')
         title = str(item.get('title') or video_url).replace('"', '""')
