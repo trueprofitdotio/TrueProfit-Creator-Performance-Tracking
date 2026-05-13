@@ -176,10 +176,10 @@ def check_youtube_video_status(video_id: str) -> str:
             items = data.get('items', [])
 
             if not items:
-                return "Unlisted/Removed"
+                return "UNLISTED/REMOVED"
 
             privacy = items[0].get('status', {}).get('privacyStatus', '').lower()
-            return "Healthy" if privacy == 'public' else "Unlisted/Removed"
+            return "HEALTHY" if privacy == 'public' else "UNLISTED/REMOVED"
 
         except Exception as e:
             return "Unknown"
@@ -203,15 +203,15 @@ def check_non_yt_status(url: str) -> str:
             info = ydl.extract_info(url, download=False)
             view_count = info.get('view_count')
             if view_count is not None and isinstance(view_count, int):
-                return "Healthy"
+                return "HEALTHY"
             else:
-                return "Unlisted/Removed"
+                return "UNLISTED/REMOVED"
     except Exception as e:
         err_str = str(e).lower()
         BLOCKED_KEYWORDS = ["block", "429", "rate limit", "login required", "cookies"]
         if any(kw in err_str for kw in BLOCKED_KEYWORDS):
             return "Blocked"
-        return "Unlisted/Removed"
+        return "UNLISTED/REMOVED"
 
 
 # --- TASK 1: SYNC TỪ SHEET PROGRESS -> SUPABASE ---
@@ -286,9 +286,9 @@ def sync_progress_to_db():
                 'total_package': package,
                 'content_count': content_count
             }
-            # Chỉ set status mặc định là Active nếu chưa tồn tại
+            # Chỉ set status mặc định là HEALTHY nếu chưa tồn tại
             if new_id not in existing_videos:
-                video_data['status'] = 'Active'
+                video_data['status'] = 'HEALTHY'
 
             try:
                 # Upsert dựa trên new_id thay vì video_url
@@ -303,8 +303,8 @@ def sync_progress_to_db():
 def track_youtube_views():
     print("\n>>> TASK 2: Tracking Views...")
     try:
-        # Lấy danh sách video đang hoạt động
-        videos = supabase.table('videos').select('*').neq('status', 'Unlisted/Removed').execute().data
+        # Lấy danh sách video đang hoạt động (không phải UNLISTED/REMOVED)
+        videos = supabase.table('videos').select('*').neq('status', 'UNLISTED/REMOVED').execute().data
     except Exception as e:
         print(f"❌ Lỗi Supabase: {repr(e)}")
         return
@@ -411,7 +411,7 @@ def update_video_statuses():
     except: return
 
     for v in videos:
-        vid_id, url, current = v['id'], v['video_url'], v.get('status', 'Active')
+        vid_id, url, current = v['id'], v['video_url'], v.get('status', 'HEALTHY')
         yt_id = extract_video_id(url)
 
         if yt_id:
